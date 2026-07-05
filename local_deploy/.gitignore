@@ -1,0 +1,8 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime data — the entire library is local and never tracked.
+# The tool auto-creates inbox/, output/, work/, state/, output/.sidecar/ on run
+# (see run.py / convert.py); drop PDFs in library/inbox/ and Markdown lands in library/output/.
+library/
