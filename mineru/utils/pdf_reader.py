@@ -10,8 +10,8 @@ from mineru.utils.pdfium_guard import pdfium_guard
 
 def page_to_image(
     page: PdfPage,
-    dpi: int = 200,
-    max_width_or_height: int = 3500,  # changed from 4500 to 3500
+    dpi: int = 300,  # raised 200->300 (local_deploy max-precision)
+    max_width_or_height: int = 4500,  # raised 3500->4500 so 300 DPI isn't clipped on A4/Legal
 ) -> (Image.Image, float):
     with pdfium_guard():
         scale = dpi / 72

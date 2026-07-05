@@ -32,7 +32,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
 
 
-DEFAULT_PDF_IMAGE_DPI = 200
+DEFAULT_PDF_IMAGE_DPI = 300  # raised 200->300 for max-precision extraction (local_deploy)
 # DEFAULT_PDF_IMAGE_DPI = 144
 MAX_PDF_RENDER_PROCESSES = 3
 MIN_PAGES_PER_RENDER_PROCESS = 30
