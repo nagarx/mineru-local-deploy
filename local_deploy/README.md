@@ -31,12 +31,22 @@ Anything suspicious lands in a per-paper `*.qa.json` and the batch `report.md` f
 ## Prerequisites (one-time, already done on this machine)
 
 - `uv` venv on Python 3.12 at `../.venv`, MinerU installed editable with `[all]` (incl. `mlx-vlm`).
-- **Critical dependency pin (do this after install):** `pdftext 0.7.0` pulls `pypdfium2 5.9.0`,
-  which is incompatible with MinerU 3.4.0 (it removed `PdfImage.get_pos` and made `PageChars`
-  non-iterable) and **crashes on some PDFs** (and breaks `-m txt`). Pin the compatible pair:
-  ```bash
-  uv pip install "pdftext==0.6.3" "pypdfium2>=4.30,<5"
-  ```
+  Restore/extend the env ONLY with `uv pip install -e ".[all]"` — never a blind `uv sync` (see below).
+- **Critical dependency pair — enforced in three layers.** `pdftext 0.7.x` / `pypdfium2 5.x` break
+  MinerU 3.4.0 twice over: 5.x removed `PdfImage.get_pos`, so `pdf_classify` crashes and **silently
+  degrades every document to forced-OCR**; and 0.7.x returns a non-iterable `PageChars`, so any
+  `txt`-classified document **crashes both backends deterministically**. This regressed once
+  (2026-07-08: a `uv` re-lock reverted a manual pin and cost a books run), so it is now enforced:
+  1. **`pyproject.toml` bounds** (`pypdfium2>=4.30.0,<5`, `pdftext>=0.6.3,<0.7`) — every resolver
+     (uv / pip / fresh clone) lands on the compatible pair.
+  2. **Runtime preflight** — `convert.preflight_deps()` aborts every model-running
+     `run.py`/`convert.py` invocation loudly if the pair is wrong (2-second failure instead of a
+     silently degraded run; offline paths like `--status`/`--verify`/`--rebuild` skip it by design).
+  3. Manual recovery one-liner if an env ever drifts anyway:
+     `uv pip install "pdftext==0.6.3" "pypdfium2>=4.30,<5"`
+  There is deliberately **no `uv.lock`** in this repo: the one that briefly existed was a fresh
+  resolution that diverged from the validated env on 12 packages (incl. torch), and syncing from
+  it is exactly what caused the incident.
 - Models downloaded (`mineru-models-download -s huggingface -m all`); paths in `~/mineru.json`.
 - (Max precision) source DPI raised 200 → 300 in `mineru/utils/pdf_image_tools.py` and the
   render cap 3500 → 4500 in `mineru/utils/pdf_reader.py`.
@@ -50,26 +60,43 @@ Anything suspicious lands in a per-paper `*.qa.json` and the batch `report.md` f
 >                   allow_patterns=["models/MFR/unimernet_hf_small_2503/*"])
 > ```
 
-## Bulk library — 200+ PDFs, cyclic & resumable (recommended)
+## Bulk library — two tracks (research papers + books), cyclic & resumable
 
-Drop PDFs into `local_deploy/library/inbox/` (any number, anytime; subfolders fine), then:
+Papers and books run as **two independent libraries** — separate inboxes, outputs, and ledgers,
+selected with `--root`, so nothing is ever mixed:
 
-```bash
-python local_deploy/run.py --loop         # process everything, cycle by cycle, until drained
-# or one cycle at a time:
-python local_deploy/run.py                # next 8 PDFs, then exit (repeat whenever)
-python local_deploy/run.py --status       # counts + refresh report.md
-python local_deploy/run.py --verify       # assert every 'done' paper has its .md
-python local_deploy/run.py --retry-failed # requeue anything that failed, then cycle
-python local_deploy/run.py --rebuild      # re-emit every .md from the .sidecar cache (offline, no models)
+```
+library/
+  research_papers/   ← TRACK 1: drop paper PDFs in inbox/ ;  paper .md in output/
+  books/             ← TRACK 2: drop PRE-SPLIT chapter PDFs in inbox/ ;  chapter .md in output/
 ```
 
-- **PDFs in:** `library/inbox/`.  **Markdown out:** `library/output/<slug>.md` — the single, self-contained deliverable your agents read (clean text + `$$LaTeX$$` + `<table>` HTML, with `<!-- page N -->` markers and a leading `MINERU-QA` trust/provenance header). The structured JSON (`content_list.json`, `qa.json`) is an **operator-only cache** under `library/output/.sidecar/`, off the agent path — see "Why Markdown-only" below.
-- **Never-miss:** every PDF is tracked in an SQLite ledger by content-hash, so `done + pending + failed == total`, always. Duplicates (same content, any name) convert once; a moved/renamed PDF is never reprocessed.
-- **Fully resumable:** kill it anytime and re-run — it resumes with nothing reprocessed and nothing missed. Safe to keep copying PDFs into `inbox/` while it runs.
-- **Robust:** a corrupt/poison PDF fails *in isolation* (its batch-mates still convert) and is listed in `report.md` (never silently dropped); a file that's mid-copy/locked is skipped and retried next scan.
-- **Status:** `library/report.md` (totals + review/failed lists). Only one `run.py` per library at a time (lock-enforced).
-- Tuning: `--batch N` (PDFs/cycle, default 8), `--effort`, `--method`, `--window`.
+**Research papers** — drop PDFs straight into `library/research_papers/inbox/` (any number, anytime;
+subfolders fine), then run with that track as `--root`:
+
+```bash
+R=local_deploy/library/research_papers
+python local_deploy/run.py --root $R --loop         # process everything, cycle by cycle, until drained
+python local_deploy/run.py --root $R                # one cycle (next --batch), then exit
+python local_deploy/run.py --root $R --status       # counts + refresh report.md
+python local_deploy/run.py --root $R --verify       # assert every 'done' paper has its .md
+python local_deploy/run.py --root $R --retry-failed # requeue anything that failed, then cycle
+python local_deploy/run.py --root $R --rebuild      # re-emit every .md from the .sidecar cache (offline)
+```
+
+**Books** — a whole book (300–500 pp) blows MinerU's ~1 h/document timeout, so **split each book into
+≤55 pp chapter PDFs first** (`booksplit.py`), drop the chapters into `library/books/inbox/`, then run
+the exact same commands with `--root local_deploy/library/books`. Each chapter becomes its own `.md`.
+The pipeline can't "detect" a book — it treats every PDF identically; splitting is a *human* decision.
+
+- **`--root` is required** — it names the track; there is no default, so you never run the wrong one.
+- **Markdown out:** `<track>/output/<slug>.md` — the single, self-contained deliverable your agents read (clean text + `$$LaTeX$$` + `<table>` HTML, with `<!-- page N -->` markers and a leading `MINERU-QA` trust/provenance header). The structured JSON (`content_list.json`, `qa.json`) is an **operator-only cache** under `<track>/output/.sidecar/`, off the agent path — see "Why Markdown-only" below.
+- **Never-miss:** every PDF is tracked in a per-track SQLite ledger by content-hash, so `done + pending + failed == total`, always. Duplicates (same content, any name) convert once; a moved/renamed PDF is never reprocessed.
+- **Fully resumable:** kill it anytime and re-run — it resumes with nothing reprocessed and nothing missed. Safe to keep copying PDFs into a track's `inbox/` while it runs.
+- **Robust:** a corrupt/poison PDF fails *in isolation* (its batch-mates still convert) and is listed in the track's `report.md` (never silently dropped); a file that's mid-copy/locked is skipped and retried next scan.
+- **Isolated:** each track has its own ledger, lock, and `report.md` — run one track at a time on 16 GB (both backends are memory-heavy). Tuning: `--batch N` (PDFs/cycle, default 8), `--effort`, `--method`, `--window`.
+
+> The completed first corpus (137 files) is archived intact at `library/_archive_first_corpus/` — still a runnable root: `run.py --root local_deploy/library/_archive_first_corpus --status`.
 
 ## One-off run (a single folder or file)
 
@@ -116,12 +143,12 @@ get one clean, self-describing file.
 
 ## Notes
 
-- **Method:** runs `-m auto`, which classifies these (math-heavy) born-digital papers as OCR and
-  reads body text with the VLM. Native-text mode (`-m txt`, character-exact) is currently broken on
-  pypdfium2 5.9.0 (`'PageChars' object is not iterable`), so we rely on OCR — and the coverage net
-  independently validates the OCR text against the PDF's own text layer, so any OCR transcription
-  error surfaces as a numeral/word-recall drop. A page-by-page adversarial audit of the OCR output
-  on the test set found **zero** content loss or transcription errors.
+- **Method:** runs `-m auto`, which picks per document: character-exact **native text** for clean
+  born-digital text layers, **VLM OCR** otherwise (bad/rotated/garbled layers). Both modes are
+  adversarially ground-truth-audited faithful, and the coverage net independently validates the body
+  text against the PDF's own text layer either way, so any transcription error surfaces as a
+  word-recall drop. (`-m txt`/`-m ocr` force a mode. The pdftext/pypdfium2 pin above is what keeps
+  the native-text path working — on pdftext 0.7.x it crashes; that is enforced, not assumed.)
 - **`needs_review` vs `notes`:** `review_reasons` are hard triggers (failed table/equation, low
   coverage/cross-check recall, a suspect page). `notes` are informational and do NOT trigger review
   (OCR mode; hybrid-vs-pipeline table-count differences from the pipeline over-splitting a merged

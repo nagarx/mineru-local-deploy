@@ -186,7 +186,8 @@ class Library:
                  f"- **in progress:** {c['in_progress']}",
                  f"- **failed:** {c['failed']}", ""]
         if failed:
-            lines.append("## ⚠ FAILED — inspect or `run.py --retry-failed`")
+            root = Path(report_path).expanduser().resolve().parent
+            lines.append(f"## ⚠ FAILED — inspect or `run.py --root {root} --retry-failed`")
             for slug, src, err, att in failed:
                 lines.append(f"- **{slug}** (attempt {att}/{MAX_ATTEMPTS}): {(err or '')[:180]}")
                 lines.append(f"    - source: `{src}`")

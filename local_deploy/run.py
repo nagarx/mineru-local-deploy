@@ -2,12 +2,13 @@
 """
 run.py — cyclic, resumable, never-miss driver for a large PDF library.
 
-Drop PDFs into  <root>/inbox/  (default root: local_deploy/library/). Each invocation
-processes ONE cycle of the next N pending PDFs and exits; run it as often as you like, or
-pass --loop to drain the whole inbox unattended. State lives in an SQLite ledger, so it is
-fully resumable — kill it anytime and re-run; nothing is reprocessed or missed.
+Drop PDFs into  <root>/inbox/.  --root is REQUIRED — this repo runs two independent tracks,
+research_papers/ and books/, each a self-contained library (own inbox/output/ledger) so they
+never mix. Each invocation processes ONE cycle of the next N pending PDFs and exits; run it as
+often as you like, or pass --loop to drain the whole inbox unattended. State lives in an SQLite
+ledger, so it is fully resumable — kill it anytime and re-run; nothing is reprocessed or missed.
 
-  <root>/
+  <root>/               (research_papers/ or books/ — pick exactly one per invocation)
     inbox/            you drop PDFs here (recursive; subfolders fine)
     output/           <slug>.md   <- the ONLY agent-facing file (QA header + page markers inside)
       .sidecar/       <slug>.content_list.json + <slug>.qa.json   <- operator cache, NOT for agents
@@ -15,13 +16,14 @@ fully resumable — kill it anytime and re-run; nothing is reprocessed or missed
     state/ledger.db   the ledger (source of truth) + run.lock (single-instance guard)
     report.md         rolling status
 
-Usage:
-  python local_deploy/run.py                 # one cycle of the next --batch PDFs
-  python local_deploy/run.py --loop          # keep cycling until the inbox is drained
-  python local_deploy/run.py --status        # print counts + refresh report.md
-  python local_deploy/run.py --verify        # assert every 'done' paper has its .md
-  python local_deploy/run.py --retry-failed   # requeue failed papers, then cycle
-  python local_deploy/run.py --rebuild       # re-emit every .md from the .sidecar cache (offline, no models)
+Usage (pick a track with --root — research_papers or books):
+  R=local_deploy/library/research_papers               # (or .../library/books for the books track)
+  python local_deploy/run.py --root $R --loop          # keep cycling until the inbox is drained
+  python local_deploy/run.py --root $R                 # one cycle of the next --batch PDFs
+  python local_deploy/run.py --root $R --status        # print counts + refresh report.md
+  python local_deploy/run.py --root $R --verify        # assert every 'done' paper has its .md
+  python local_deploy/run.py --root $R --retry-failed  # requeue failed papers, then cycle
+  python local_deploy/run.py --root $R --rebuild       # re-emit every .md from the .sidecar cache (offline, no models)
 """
 
 from __future__ import annotations
@@ -185,7 +187,10 @@ def process_cycle(lib: library.Library, root: Path, batch_size: int, cfg: dict) 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Cyclic, resumable PDF->Markdown library driver.")
-    ap.add_argument("--root", default=str(_HERE / "library"), help="library root (default: local_deploy/library)")
+    ap.add_argument("--root", required=True,
+                    help="library root for the track to run (REQUIRED; no default, so you never "
+                         "run the wrong track): e.g. local_deploy/library/research_papers or "
+                         ".../library/books")
     ap.add_argument("--batch", type=int, default=8, help="PDFs per cycle (default 8)")
     ap.add_argument("--loop", action="store_true", help="keep cycling until the inbox is drained")
     ap.add_argument("--status", action="store_true", help="print counts + refresh report.md, then exit")
@@ -200,6 +205,8 @@ def main() -> None:
     args = ap.parse_args()
 
     root = Path(args.root).expanduser().resolve()
+    if not root.exists():   # a typo'd --root must not silently create a fresh empty track
+        raise SystemExit(f"--root {root} does not exist — mkdir it first if you meant to start a new track")
     (root / "inbox").mkdir(parents=True, exist_ok=True)
     (root / "state").mkdir(parents=True, exist_ok=True)
     lib = library.Library(root / "state" / "ledger.db")
@@ -229,11 +236,13 @@ def main() -> None:
         lib.close()
         return
 
-    problems = convert.preflight_models()
+    problems = convert.preflight_deps() + convert.preflight_models()
     if problems:
         for p in problems:
-            log(f"MODEL PROBLEM: {p}")
-        raise SystemExit("Model weights incomplete — fix with: mineru-models-download -s huggingface -m all")
+            log(f"PREFLIGHT PROBLEM: {p}")
+        raise SystemExit("Preflight failed — fix the problem(s) above before running "
+                         "(deps: see the pin in local_deploy/README.md; models: "
+                         "mineru-models-download -s huggingface -m all)")
 
     if args.retry_failed:
         log(f"requeued {lib.requeue_failed()} failed paper(s)")
