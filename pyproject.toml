@@ -38,10 +38,10 @@ dependencies = [
     "requests",
     "httpx",
     "pillow>=11.0.0",
-    "pypdfium2>=4.30.0",
+    "pypdfium2>=4.30.0,<5",  # 5.x removes PdfImage.get_pos (pdf_classify silently force-OCRs every doc)
     "pypdf>=5.6.0",
     "reportlab",
-    "pdftext>=0.6.3",
+    "pdftext>=0.6.3,<0.7",   # 0.7.x returns a non-iterable PageChars -> '-m txt' crashes; pairs with pypdfium2<5
     "modelscope>=1.26.0",
     "huggingface-hub>=0.32.4",
     "json-repair>=0.46.2",

@@ -122,6 +122,51 @@ def preflight_models() -> list[str]:
     return problems
 
 
+def preflight_deps() -> list[str]:
+    """Verify the pdftext/pypdfium2 pair this MinerU actually works with. pdftext 0.7.x /
+    pypdfium2 5.x break the fork twice over: pdf_classify crashes on the removed
+    PdfImage.get_pos (silently degrading EVERY doc to forced-OCR) and '-m txt' dies on a
+    non-iterable PageChars. A uv re-lock regressed exactly this on 2026-07-08 and cost a
+    books run — so refuse to start on a bad pair. The bounds live in pyproject.toml; this
+    catches any install that bypassed them."""
+    from importlib import metadata
+    problems: list[str] = []
+
+    def _ver(v: str) -> tuple[int, int, int]:
+        """Numeric-prefix version triple; never raises ('4.30.0.post1' -> (4, 30, 0))."""
+        out = []
+        for tok in (v.split(".") + ["0", "0", "0"])[:3]:
+            digits = ""
+            for ch in tok:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            out.append(int(digits) if digits else 0)
+        return tuple(out)
+
+    checks = (
+        ("pypdfium2", lambda v: (4, 30, 0) <= _ver(v) < (5, 0, 0), ">=4.30,<5"),
+        ("pdftext", lambda v: (0, 6, 3) <= _ver(v) < (0, 7, 0), ">=0.6.3,<0.7"),
+    )
+    for pkg, ok, want in checks:
+        try:
+            v = metadata.version(pkg)
+            if not ok(v):
+                problems.append(f"{pkg} {v} is incompatible with this MinerU (need {want})")
+        except Exception as e:
+            problems.append(f"{pkg} missing/unreadable: {e}")
+    if not problems:
+        try:
+            import pypdfium2 as pdfium   # behavior check, not just version strings
+            if not hasattr(pdfium.PdfImage, "get_pos"):
+                problems.append("pypdfium2.PdfImage.get_pos missing — pdf_classify would silently force-OCR every doc")
+        except Exception as e:
+            problems.append(f"pypdfium2 import failed: {type(e).__name__}: {e}")
+    if problems:
+        problems.append('fix: uv pip install "pdftext==0.6.3" "pypdfium2>=4.30,<5"')
+    return problems
+
+
 def run_backend_phase(input_path: Path, out_dir: Path, backend: str, effort: str,
                       window: int, method: str = "auto") -> int:
     """Run one backend over the whole input as a subprocess (models load once, then
@@ -332,12 +377,13 @@ def main() -> None:
     log(f"{len(pdfs)} PDF(s); phases={phases}; workdir={workdir}")
 
     if {"hybrid", "pipeline"} & set(phases):
-        problems = preflight_models()
+        problems = preflight_deps() + preflight_models()
         if problems:
             for p in problems:
-                log(f"MODEL PROBLEM: {p}")
-            raise SystemExit("Model weights incomplete — fix with: "
-                             "mineru-models-download -s huggingface -m all")
+                log(f"PREFLIGHT PROBLEM: {p}")
+            raise SystemExit("Preflight failed — fix the problem(s) above before running "
+                             "(deps: see the pin in local_deploy/README.md; models: "
+                             "mineru-models-download -s huggingface -m all)")
 
     if "hybrid" in phases:
         rc = run_backend_phase(input_path, workdir / "hybrid", "hybrid-engine",
