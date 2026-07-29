@@ -38,10 +38,28 @@ dependencies = [
     "requests",
     "httpx",
     "pillow>=11.0.0",
-    "pypdfium2>=4.30.0,<5",  # 5.x removes PdfImage.get_pos (pdf_classify silently force-OCRs every doc)
+    # DELIBERATELY TIGHTER THAN UPSTREAM (upstream 3.4.4 allows pdftext<0.8 / pypdfium2<6).
+    # DO NOT RELAX. The two bugs that originally forced this pin ARE fixed in 3.4.4
+    # (PdfImage.get_pos via _get_pdfium_page_object_bounds, PageChars via
+    # _ensure_legacy_chars) — but a third, worse reason now keeps it:
+    #
+    #   pdftext >=0.7 DESTROYS every non-BMP character. Its get_chars() does
+    #       if 0xD800 <= code <= 0xDFFF: code = 0xFFFD
+    #   treating UTF-16 surrogates as corruption. They are not: FPDFText_GetUnicode
+    #   returns UTF-16 CODE UNITS, so every codepoint above U+FFFF legitimately arrives
+    #   as a surrogate PAIR — which is the whole Mathematical Alphanumeric Symbols block
+    #   (U+1D400–U+1D7FF), i.e. the italic variables maths-heavy papers use for x, t, X, θ.
+    #   Measured on one page of CROSSFORMER: 0.6.3 yields 190 recoverable glyphs;
+    #   0.7.1 yields 380 U+FFFD and 0 recoverable. The loss happens INSIDE pdftext,
+    #   so no downstream repair can undo it — unlike the '??' it replaces.
+    #
+    # mineru/utils/pdf_text_tool.py::_merge_surrogate_pairs decodes the pairs correctly,
+    # but it can only do so while pdftext still hands us the halves. Guarded at runtime by
+    # local_deploy/convert.py::preflight_deps and tests/local_deploy/test_surrogate_pairs.py.
+    "pypdfium2>=4.30.0,<5",  # pdftext pins this exactly (0.6.3 -> ==4.30.0); they move as a pair
     "pypdf>=5.6.0",
     "reportlab",
-    "pdftext>=0.6.3,<0.7",   # 0.7.x returns a non-iterable PageChars -> '-m txt' crashes; pairs with pypdfium2<5
+    "pdftext>=0.6.3,<0.7",   # see the block comment above — relaxing this silently destroys maths
     "modelscope>=1.26.0",
     "huggingface-hub>=0.32.4",
     "json-repair>=0.46.2",

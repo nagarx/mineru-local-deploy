@@ -2,13 +2,23 @@
 import math
 from typing import Any, List
 
+import numpy as np
 import pypdfium2 as pdfium
 from pdftext.pdf.chars import deduplicate_chars, get_chars
 from pdftext.pdf.pages import assign_scripts, get_blocks, get_lines, get_spans
+from pdftext.schema import Bbox
 
 from mineru.utils.pdfium_guard import close_pdfium_child, pdfium_guard
 
+try:
+    from pdftext.pdf.chars import PageChars
+except ImportError:
+    PageChars = None
+
 NEAR_IDENTICAL_CHAR_BBOX_TOLERANCE = 1.0
+OFFSET_DUPLICATE_CHAR_BBOX_TOLERANCE = 2.5
+OFFSET_DUPLICATE_TRANSLATION_TOLERANCE = 0.1
+OFFSET_DUPLICATE_MIN_BBOX_OVERLAP_RATIO = 0.45
 
 
 def get_page(
@@ -32,6 +42,73 @@ def get_page(
         "rotation": page_chars["rotation"],
         "blocks": blocks,
     }
+
+
+def _merge_surrogate_pairs(chars):
+    """Recombine UTF-16 surrogate halves into the single character they actually encode.
+
+    LOCAL FORK PATCH — not upstream, and not fixed upstream as of MinerU 3.4.4. Re-apply
+    it after every `git merge upstream/master`; tests/local_deploy/test_surrogate_pairs.py
+    fails loudly if it is ever lost.
+
+    pdftext's `get_chars` does `chr(FPDFText_GetUnicode(textpage, i))`, but that PDFium API
+    returns a UTF-16 CODE UNIT, not a codepoint. Every character outside the BMP therefore
+    arrives as TWO lone surrogates — and that covers the whole Mathematical Alphanumeric
+    Symbols block (U+1D400–U+1D7FF), i.e. the italic variables that maths-heavy papers use
+    for x, t, X, θ … Lone surrogates cannot be encoded, so downstream they are either
+    dropped outright or replaced by '?' apiece, which is exactly where the literal '??'
+    seen in extracted body text came from (1,187 occurrences corpus-wide before this fix).
+
+    Upstream treats surrogates as corruption to be stripped rather than pairs to be
+    decoded — see MinerU #1203/#1546/#2525/#4685, and pdftext >=0.7 which rewrites every
+    surrogate to U+FFFD inside get_chars. That is why pyproject pins pdftext<0.7: once
+    pdftext has replaced the halves there is nothing left here to recombine.
+
+    The two halves share one glyph box, so the first char's bbox/font are kept verbatim and
+    the second is dropped — layout is unchanged, only the text is corrected.
+
+    Shape-defensive: anything that is not pdftext's legacy list-of-dicts (e.g. the columnar
+    PageChars of 0.7) is returned untouched, so this degrades to a no-op instead of raising
+    if the dependency shape moves. Blocking that upgrade is preflight_deps()'s job, not this
+    function's.
+    """
+    if not chars or not isinstance(chars, list) or not isinstance(chars[0], dict):
+        return chars
+    out: List[dict] = []
+    i = 0
+    while i < len(chars):
+        cur = chars[i]
+        text = cur.get("char") or ""
+        if len(text) == 1 and 0xD800 <= ord(text) <= 0xDBFF and i + 1 < len(chars):
+            nxt = chars[i + 1].get("char") or ""
+            if len(nxt) == 1 and 0xDC00 <= ord(nxt) <= 0xDFFF:
+                cp = 0x10000 + ((ord(text) - 0xD800) << 10) + (ord(nxt) - 0xDC00)
+                merged = dict(cur)
+                merged["char"] = chr(cp)
+                out.append(merged)
+                i += 2
+                continue
+        if len(text) == 1 and 0xD800 <= ord(text) <= 0xDFFF:
+            # An UNPAIRABLE half — a genuinely broken ToUnicode CMap, not a non-BMP
+            # codepoint. Observed e.g. in ChronosX p3 as U+D835 followed by '!' rather
+            # than a low surrogate. Nothing can recover the intended character, and a
+            # lone surrogate is not UTF-8 encodable: it crashes any writer that touches
+            # it (json.dump, Path.write_text) and otherwise vanishes silently downstream.
+            # So substitute U+FFFD here — the standard "undecodable input" marker, and
+            # visible to a reader rather than a silent deletion.
+            #
+            # This is precisely pdftext >=0.7's remedy, applied ONLY where it is correct.
+            # 0.7's bug is applying it to valid surrogate PAIRS as well, which destroys
+            # every non-BMP maths glyph; the branch above decodes those first, so only
+            # the truly unrecoverable halves reach this line.
+            broken = dict(cur)
+            broken["char"] = "�"
+            out.append(broken)
+            i += 1
+            continue
+        out.append(cur)
+        i += 1
+    return out
 
 
 def _get_char_bbox_coords(char: dict[str, Any]) -> tuple[float, ...]:
@@ -67,6 +144,75 @@ def _is_near_identical_bbox(
     )
 
 
+def _calculate_bbox_overlap_in_smaller_area(
+    bbox_a: tuple[float, ...],
+    bbox_b: tuple[float, ...],
+) -> float:
+    """计算两个字符框交集占较小字符框面积的比例。"""
+    intersection_width = max(
+        0.0,
+        min(bbox_a[2], bbox_b[2]) - max(bbox_a[0], bbox_b[0]),
+    )
+    intersection_height = max(
+        0.0,
+        min(bbox_a[3], bbox_b[3]) - max(bbox_a[1], bbox_b[1]),
+    )
+    bbox_a_area = max(0.0, bbox_a[2] - bbox_a[0]) * max(
+        0.0,
+        bbox_a[3] - bbox_a[1],
+    )
+    bbox_b_area = max(0.0, bbox_b[2] - bbox_b[0]) * max(
+        0.0,
+        bbox_b[3] - bbox_b[1],
+    )
+    smaller_area = min(bbox_a_area, bbox_b_area)
+    if smaller_area == 0:
+        return 0.0
+    return intersection_width * intersection_height / smaller_area
+
+
+def _is_adjacent_offset_duplicate_char(
+    previous_char: dict[str, Any],
+    current_char: dict[str, Any],
+) -> bool:
+    """识别相邻字符中由对角平移阴影产生的第二个重复字符。"""
+    if _get_visible_char_signature(previous_char) != _get_visible_char_signature(
+        current_char
+    ):
+        return False
+
+    previous_bbox = _get_char_bbox_coords(previous_char)
+    current_bbox = _get_char_bbox_coords(current_char)
+    x_start_offset = current_bbox[0] - previous_bbox[0]
+    y_start_offset = current_bbox[1] - previous_bbox[1]
+    x_end_offset = current_bbox[2] - previous_bbox[2]
+    y_end_offset = current_bbox[3] - previous_bbox[3]
+
+    # 阴影层应是同一字符框的刚性平移，避免把大小不同的相邻同字误判为重复。
+    if (
+        abs(x_start_offset - x_end_offset)
+        > OFFSET_DUPLICATE_TRANSLATION_TOLERANCE
+        or abs(y_start_offset - y_end_offset)
+        > OFFSET_DUPLICATE_TRANSLATION_TOLERANCE
+    ):
+        return False
+
+    if not (
+        NEAR_IDENTICAL_CHAR_BBOX_TOLERANCE
+        < abs(x_start_offset)
+        <= OFFSET_DUPLICATE_CHAR_BBOX_TOLERANCE
+        and NEAR_IDENTICAL_CHAR_BBOX_TOLERANCE
+        < abs(y_start_offset)
+        <= OFFSET_DUPLICATE_CHAR_BBOX_TOLERANCE
+    ):
+        return False
+
+    return (
+        _calculate_bbox_overlap_in_smaller_area(previous_bbox, current_bbox)
+        >= OFFSET_DUPLICATE_MIN_BBOX_OVERLAP_RATIO
+    )
+
+
 def _get_near_identical_bbox_bucket_key(
     bbox_coords: tuple[float, ...],
 ) -> tuple[int, int]:
@@ -87,6 +233,115 @@ def _iter_neighbor_bbox_bucket_keys(
             yield bucket_x + offset_x, bucket_y + offset_y
 
 
+def _is_pdftext_page_chars(chars: Any) -> bool:
+    """判断对象是否为 pdftext 0.7 引入的 PageChars 列式字符容器。"""
+    return PageChars is not None and isinstance(chars, PageChars)
+
+
+def _materialize_page_chars(chars) -> list[dict[str, Any]]:
+    """将 pdftext 0.7 的 PageChars 物化为 MinerU 既有 char dict 列表。"""
+    boxes = chars.boxes.tolist()
+    rotations = chars.rotations.tolist()
+    font_ids = chars.font_ids.tolist()
+    char_indices = chars.char_indices.tolist()
+
+    return [
+        {
+            "bbox": Bbox([float(coord) for coord in boxes[index]]),
+            "char": chars.text[index],
+            "rotation": float(rotations[index]),
+            "font": chars.fonts[int(font_ids[index])],
+            "char_idx": int(char_indices[index]),
+        }
+        for index in range(len(chars))
+    ]
+
+
+def _ensure_legacy_chars(chars) -> list[dict[str, Any]]:
+    """统一输出旧版 char dict 列表，隔离 pdftext 0.7 的返回结构变化。"""
+    if _is_pdftext_page_chars(chars):
+        return _materialize_page_chars(chars)
+    return chars
+
+
+def _get_single_char_text(char: dict[str, Any]) -> str:
+    """提取单个 PDF 字符文本，异常空值用替换符保证 PageChars 长度一致。"""
+    text = char.get("char", "")
+    if len(text) == 1:
+        return text
+    return text[:1] or "\uFFFD"
+
+
+def _get_char_font_id(
+    char: dict[str, Any],
+    fonts: list[dict[str, Any]],
+    font_cache: dict[tuple[Any, Any, Any, Any], int],
+) -> int:
+    """为旧版字符 font 生成 PageChars 需要的页内 font id。"""
+    font = char.get("font") or {}
+    font_key = (
+        font.get("name"),
+        font.get("flags"),
+        font.get("size"),
+        font.get("weight"),
+    )
+    font_id = font_cache.get(font_key)
+    if font_id is None:
+        font_id = len(fonts)
+        font_cache[font_key] = font_id
+        fonts.append(
+            {
+                "name": font.get("name"),
+                "flags": font.get("flags"),
+                "size": font.get("size"),
+                "weight": font.get("weight"),
+            }
+        )
+    return font_id
+
+
+def _get_char_index(char: dict[str, Any], fallback_idx: int) -> int:
+    """提取旧版字符索引，缺失或为空时回退到当前列表位置。"""
+    char_idx = char.get("char_idx")
+    if char_idx is None:
+        char_idx = fallback_idx
+    return int(char_idx)
+
+
+def _legacy_chars_to_page_chars(chars):
+    """将旧版 char dict 列表打包回 pdftext 0.7 get_spans 所需的 PageChars。"""
+    if PageChars is None or _is_pdftext_page_chars(chars):
+        return chars
+
+    fonts = []
+    font_cache = {}
+    text_parts = []
+    codes = []
+    rotations = []
+    boxes = []
+    font_ids = []
+    char_indices = []
+
+    for fallback_idx, char in enumerate(chars):
+        char_text = _get_single_char_text(char)
+        text_parts.append(char_text)
+        codes.append(ord(char_text))
+        rotations.append(float(char.get("rotation") or 0.0))
+        boxes.append(_get_char_bbox_coords(char))
+        font_ids.append(_get_char_font_id(char, fonts, font_cache))
+        char_indices.append(_get_char_index(char, fallback_idx))
+
+    return PageChars(
+        "".join(text_parts),
+        np.array(codes, dtype=np.uint32),
+        np.array(rotations, dtype=np.float64),
+        np.array(boxes, dtype=np.float64).reshape((len(boxes), 4)),
+        np.array(font_ids, dtype=np.int32),
+        fonts,
+        np.array(char_indices, dtype=np.int64),
+    )
+
+
 def _deduplicate_near_identical_chars(
     chars: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -102,6 +357,11 @@ def _deduplicate_near_identical_chars(
 
         visible_char_key = _get_visible_char_signature(char)
         bbox_coords = _get_char_bbox_coords(char)
+        if deduplicated_chars and _is_adjacent_offset_duplicate_char(
+            deduplicated_chars[-1],
+            char,
+        ):
+            continue
         bbox_bucket_key = _get_near_identical_bbox_bucket_key(bbox_coords)
         visible_char_bbox_buckets = seen_visible_char_bboxes.setdefault(
             visible_char_key,
@@ -146,9 +406,15 @@ def get_page_chars(
             if page_char_count is None:
                 page_char_count = textpage.count_chars()
 
+            # FORK PATCH: surrogates must be recombined BEFORE dedup, so dedup compares
+            # real characters. Dedup runs on (char, bbox); halves share one bbox, so
+            # deduping first can strip one half of a pair and leave the other unpairable.
             chars = deduplicate_chars(
-                get_chars(textpage, page_bbox, page_rotation, quote_loosebox)
+                _merge_surrogate_pairs(
+                    get_chars(textpage, page_bbox, page_rotation, quote_loosebox)
+                )
             )
+            chars = _ensure_legacy_chars(chars)
             chars = _deduplicate_near_identical_chars(chars)
     finally:
         if owns_textpage:
@@ -170,6 +436,7 @@ def get_lines_from_chars(
     line_distance_threshold: float = 0.1,
 ):
     """从已提取的字符构建 pdftext lines，避免重复读取 PDFium textpage。"""
+    chars = _legacy_chars_to_page_chars(chars)
     spans = get_spans(
         chars,
         superscript_height_threshold=superscript_height_threshold,
