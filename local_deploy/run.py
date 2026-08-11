@@ -259,6 +259,10 @@ def main() -> None:
     ap.add_argument("--loop", action="store_true", help="keep cycling until the inbox is drained")
     ap.add_argument("--status", action="store_true", help="print counts + refresh report.md, then exit")
     ap.add_argument("--verify", action="store_true", help="assert every 'done' paper has its .md, then exit")
+    ap.add_argument("--migrate-paths", action="store_true",
+                    help="make stored ledger paths relocatable (output_md relative to the "
+                         "track root, source_path re-homed), then exit. Idempotent.")
+    ap.add_argument("--dry-run", action="store_true", help="with --migrate-paths: report, change nothing")
     ap.add_argument("--retry-failed", action="store_true", help="requeue all failed papers before cycling")
     ap.add_argument("--rebuild", action="store_true",
                     help="re-emit every output/*.md from the .sidecar cache (offline, no models); "
@@ -281,6 +285,14 @@ def main() -> None:
         print(json.dumps(lib.counts(), indent=2))
         print(f"report: {root / 'report.md'}")
         return
+    if args.migrate_paths:
+        stats = lib.migrate_paths(dry_run=args.dry_run)
+        log(("DRY RUN — " if args.dry_run else "") + f"path migration: {json.dumps(stats)}")
+        missing = lib.verify_outputs()
+        print("MISSING outputs for 'done' papers:", len(missing) or "none — all accounted for")
+        lib.close()
+        return
+
     if args.verify:
         missing = lib.verify_outputs()
         print("MISSING outputs for 'done' papers:", missing or "none — all accounted for")

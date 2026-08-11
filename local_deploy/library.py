@@ -42,8 +42,17 @@ def slugify(name: str) -> str:
 
 
 class Library:
+    #: `output_md` is stored RELATIVE to the track root and resolved at read time, so the
+    #: whole data root can be relocated without a migration. Absolute paths were the
+    #: original design and they broke twice: `_archive_first_corpus` sat 137/137 unverifiable
+    #: for a month, and the 2026-08-11 relocation invalidated all 636 rows at once. The
+    #: value is fully derivable (`output/<slug>.md`), so storing it absolutely bought
+    #: nothing and cost relocatability.
+    SCHEMA_VERSION = 2
+
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
+        self.root = self.db_path.parent.parent      # <track>/state/ledger.db -> <track>
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -140,11 +149,28 @@ class Library:
 
     # --- results --------------------------------------------------------------
 
+    def _relativise(self, path: str | Path) -> str:
+        """Store paths under the track root as relative; leave anything else alone."""
+        p = Path(path)
+        if not p.is_absolute():
+            return str(p)
+        try:
+            return str(p.resolve().relative_to(self.root.resolve()))
+        except ValueError:
+            return str(p)
+
+    def resolve_output(self, output_md: str | None) -> Path | None:
+        """Read-side counterpart of _relativise."""
+        if not output_md:
+            return None
+        p = Path(output_md)
+        return p if p.is_absolute() else self.root / p
+
     def mark_done(self, fid: str, output_md: str, needs_review: bool, pages: int | None = None) -> None:
         self.conn.execute(
             "UPDATE papers SET status='done', needs_review=?, output_md=?, pages=?, "
             "error=NULL, updated_at=? WHERE id=?",
-            (1 if needs_review else 0, output_md, pages, _now(), fid))
+            (1 if needs_review else 0, self._relativise(output_md), pages, _now(), fid))
         self.conn.commit()
 
     def mark_failed(self, fid: str, error: str) -> None:
@@ -169,9 +195,57 @@ class Library:
         missing = []
         for slug, omd in self.conn.execute(
                 "SELECT slug, output_md FROM papers WHERE status='done'"):
-            if not omd or not Path(omd).exists():
+            p = self.resolve_output(omd)
+            if p is None or not p.exists():
                 missing.append(slug)
         return missing
+
+    def migrate_paths(self, dry_run: bool = False) -> dict[str, int]:
+        """Make stored paths relocatable, and re-home any that point at a vanished tree.
+
+        Idempotent. `output_md` becomes `output/<slug>.md` — the invariant the writer has
+        always used — so it survives any future move of the data root. `source_path` is
+        re-pointed into this track when its recorded location no longer exists; it is
+        transient anyway (register_inbox rewrites it every scan), but leaving it dangling
+        makes a requeue fail instantly.
+        """
+        stats = {"output_md_relativised": 0, "source_path_rehomed": 0, "source_path_missing": 0}
+        rows = self.conn.execute("SELECT id, slug, source_path, output_md FROM papers").fetchall()
+        # Index this track first, then sibling tracks — the same order find_source_pdf uses.
+        # Siblings matter: 103 of research_papers' 302 source PDFs physically live under
+        # _archive_first_corpus, so a track-only scan leaves a third of the corpus dangling.
+        by_name: dict[str, Path] = {}
+
+        def _index(base: Path) -> None:
+            for sub in ("inbox", "done", "_originals"):
+                d = base / sub
+                if d.is_dir():
+                    for p in d.rglob("*.pdf"):
+                        by_name.setdefault(p.name, p)
+
+        _index(self.root)
+        if self.root.parent.is_dir():
+            for sibling in sorted(self.root.parent.iterdir()):
+                if sibling.is_dir() and sibling != self.root:
+                    _index(sibling)
+        for fid, slug, src, omd in rows:
+            want_omd = f"output/{slug}.md"
+            if omd != want_omd:
+                stats["output_md_relativised"] += 1
+                if not dry_run:
+                    self.conn.execute("UPDATE papers SET output_md=? WHERE id=?", (want_omd, fid))
+            if src and not Path(src).exists():
+                hit = by_name.get(Path(src).name)
+                if hit is not None:
+                    stats["source_path_rehomed"] += 1
+                    if not dry_run:
+                        self.conn.execute("UPDATE papers SET source_path=? WHERE id=?",
+                                          (str(hit), fid))
+                else:
+                    stats["source_path_missing"] += 1
+        if not dry_run:
+            self.conn.commit()
+        return stats
 
     def write_report(self, report_path: Path | str) -> None:
         c = self.counts()
