@@ -171,8 +171,81 @@ def repair_qq(text: str, src: str) -> tuple[str, int, int]:
 _NEG = re.compile(r"[−–](\d[\d,]*\.?\d*)")
 
 
-def repair_signs(text: str, src: str, require_unique: bool = False) -> tuple[str, int]:
+def _digit_near(text: str, i: int, step: int) -> bool:
+    """Walk away from a match past spaces; report whether a digit sits on that side.
+
+    Also steps over ONE '.' when a digit sits beyond it, so '0 . 1' reads as a spaced
+    numeral while an end-of-sentence '.' in prose does not.
+    """
+    n = len(text)
+    while 0 <= i < n and text[i] == " ":
+        i += step
+    if not (0 <= i < n):
+        return False
+    if text[i].isdigit():
+        return True
+    if text[i] == ".":
+        j = i + step
+        while 0 <= j < n and text[j] == " ":
+            j += step
+        return 0 <= j < n and text[j].isdigit()
+    return False
+
+
+# Cross-reference labels whose following number is an ORDINAL, never a signed quantity.
+# `repair_signs` matches on value alone, so a source that legitimately reads "−23" will
+# otherwise sign the unrelated "Fig. 23" in the same block.
+_ORDINAL_LABEL = re.compile(
+    r"(?:fig|figure|tab|table|eq|eqn|equation|sec|sect|section|chapter|ch|app|appendix"
+    r"|p|pp|page|no|alg|algorithm|thm|theorem|lemma|def|definition|remark|prop|proposition"
+    r"|corollary|assumption|panel|step|footnote|ref|item)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _follows_ordinal_label(text: str, start: int) -> bool:
+    """True when the number is a cross-reference ordinal ('Fig. 23', 'Table 4')."""
+    return _ORDINAL_LABEL.search(text[max(0, start - 24):start]) is not None
+
+
+def _inside_brackets(text: str, start: int) -> bool:
+    """True when the match sits inside `[...]` on its own line.
+
+    A bracketed comma-list is a tensor shape, index, or citation ('[2,128]', '[1,3]')
+    far more often than a signed quantity — signing one produced the reverted
+    `layer shape [−2,128]` regression. It can also be a real interval ('[−0.5, 0.5]'),
+    so this DECLINES rather than decides: the candidate is recorded in the audit for
+    review instead of being guessed at, per this module's never-guess contract.
+    """
+    line_start = text.rfind("\n", 0, start) + 1
+    head = text[line_start:start]
+    return head.rfind("[") > head.rfind("]")
+
+
+def _is_spaced_numeral_fragment(text: str, start: int, end: int) -> bool:
+    """True when a 'standalone' number match is really a fragment of a SPACED numeral.
+
+    MinerU emits inline maths with a space between every character, so `0.001` arrives
+    as `0 . 0 0 1`. The plain boundary guard `(?<![\\d.])1(?![\\d])` then sees a SPACE
+    before that final '1' and accepts it as a whole number — and signing it turned the
+    Mamba paper's `Uniform([0.001, 0.1])` into `[ 0 . 0 0 −1 , 0 . −1 ]`, destroying both
+    literals while the document still shipped `verdict: clean`.
+
+    Looking past the spaces is what the boundary guard cannot do: if the nearest
+    non-space neighbour on either side is a digit (or a '.' with a digit beyond it),
+    this is part of a larger number and must never be signed.
+    """
+    return _digit_near(text, start - 1, -1) or _digit_near(text, end, +1)
+
+
+def repair_signs(text: str, src: str, require_unique: bool = False,
+                 audit: list | None = None) -> tuple[str, int]:
     """Re-attach a U+2212 minus the VLM dropped from a negative number in prose.
+
+    Pass `audit` to collect one record per edit. Signing a number is the most
+    consequential change this pipeline makes to extracted content and it happens
+    BEFORE the sidecar is written, so an unrecorded edit is unrecoverable — the
+    2026-08-11 audit found two destroyed numeric literals shipping as `verdict: clean`.
 
     Anchoring on surrounding words fails here: the sign usually sits next to inline maths
     ("out-of-sample $R^{2}$ of −0.47%"), and the LaTeX that must be stripped from the target
@@ -205,6 +278,19 @@ def repair_signs(text: str, src: str, require_unique: bool = False) -> tuple[str
             before = text[:m.start()].rstrip()
             if before.endswith(("-", "−", "–")):
                 continue                      # already signed
+            if _is_spaced_numeral_fragment(text, m.start(), m.end()):
+                continue                      # a digit of `0 . 0 0 1`, not a number (C2)
+            if _follows_ordinal_label(text, m.start()):
+                continue                      # 'Fig. 23' is an ordinal, not a quantity
+            ctx = text[max(0, m.start() - 40):m.end() + 20]
+            if _inside_brackets(text, m.start()):
+                if audit is not None:         # surface the decline; never hide it
+                    audit.append({"value": val, "context": ctx,
+                                  "action": "declined", "reason": "inside brackets — "
+                                  "shape/index/citation or a real interval; ambiguous"})
+                continue
+            if audit is not None:             # never mutate content silently
+                audit.append({"value": val, "context": ctx, "action": "signed"})
             out.append(text[pos:m.start()])
             out.append("−")                   # immediately before the digits
             pos = m.start()
@@ -224,7 +310,12 @@ def repair_content_list(content_list: list[dict[str, Any]],
     `page_text(page_idx, bbox)` gives the text layer inside a block; `full_page_text(page_idx)`
     is the whole page, used for captions whose text sits outside the figure's own bbox.
     """
-    st = {"qq_fixed": 0, "qq_left": 0, "signs_fixed": 0, "blocks_repaired": 0}
+    # `sign_edits` carries one record per signed/declined number. Signing is the most
+    # consequential change made to extracted content, it happens BEFORE the sidecar is
+    # written, and it is therefore unrecoverable if unrecorded — the 2026-08-11 audit found
+    # two destroyed numeric literals shipping under `verdict: clean`. Never silent again.
+    st: dict[str, Any] = {"qq_fixed": 0, "qq_left": 0, "signs_fixed": 0,
+                          "blocks_repaired": 0, "signs_declined": 0, "sign_edits": []}
     if page_text is None:
         return st
     for b in content_list:
@@ -279,8 +370,15 @@ def repair_content_list(content_list: list[dict[str, Any]],
             # Signs the bbox cannot justify are left alone and recorded in known_defects.
             srcs = _srcs()
             if srcs:
-                new, sg = repair_signs(new, srcs[0])
+                audit: list[dict[str, Any]] = []
+                new, sg = repair_signs(new, srcs[0], audit=audit)
                 st["signs_fixed"] += sg
+                for rec in audit:
+                    rec["page_idx"] = pg
+                    rec["field"] = field
+                    st["sign_edits"].append(rec)
+                    if rec.get("action") == "declined":
+                        st["signs_declined"] += 1
             st["qq_left"] += len(re.findall(r"(?:\?\?)+", new))
             if new != v:
                 b[field] = new
