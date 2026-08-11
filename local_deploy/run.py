@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import re
 import shutil
 import sys
 import time
@@ -108,6 +109,28 @@ def _build_paper(lib: library.Library, output: Path, hy_dir: Path, pi_dir: Path,
         return "failed"
 
 
+def _norm_slug(s: str) -> str:
+    """Filename-safe slugs and real paper titles differ only in punctuation and spacing."""
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _resolve_texref(slug: str, dirs: dict[str, str]) -> str | None:
+    """Match a markdown slug to its texref bundle: exact, else UNIQUE long prefix.
+
+    MinerU truncates long titles when it builds a filename, so a few corpus slugs are
+    strict prefixes of their bundle's real title. The prefix branch requires a minimum
+    length and exactly one candidate, so truncation can never silently bind a paper to the
+    wrong paper's mathematics — the one failure here that would be worse than no pointer.
+    """
+    n = _norm_slug(slug)
+    if n in dirs:
+        return dirs[n]
+    if len(n) < 40:
+        return None
+    hits = [v for k, v in dirs.items() if k.startswith(n)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def rebuild_all(output: Path) -> int:
     """Re-emit every output/<slug>.md from the .sidecar cache — no backend, no models.
     Applies builder/policy changes (e.g. a better table renderer) across the whole library
@@ -117,6 +140,24 @@ def rebuild_all(output: Path) -> int:
     sidecar.mkdir(parents=True, exist_ok=True)
     for f in list(output.glob("*.content_list.json")) + list(output.glob("*.qa.json")):
         f.replace(sidecar / f.name)          # migrate legacy layout into the cache dir
+    # Audit findings this pipeline cannot repair (a dropped table column, an altered digit).
+    # Surfaced in each .md header so an agent sees them without opening a sidecar.
+    defects: dict = {}
+    kd_path = output.parent / "known_defects.json"
+    if kd_path.exists():
+        try:
+            defects = json.loads(kd_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log(f"  could not read {kd_path.name}: {type(e).__name__}: {e}")
+    # Author-source reference bundles (texref), built from the arXiv LaTeX for papers that
+    # have one. Matched on a normalised name because the bundle directories carry the
+    # paper's real title (spaces, punctuation) while slugs are filename-safe. Injected the
+    # same way as known_defects, so a paper picks the pointer up on its next rebuild.
+    texref_root = output.parent / "texref"
+    texref_dirs: dict[str, str] = {}
+    if texref_root.is_dir():
+        texref_dirs = {_norm_slug(d.name): d.name
+                       for d in texref_root.iterdir() if d.is_dir()}
     n = 0
     for clf in sorted(sidecar.glob("*.content_list.json")):
         slug = clf.name[: -len(".content_list.json")]
@@ -124,8 +165,13 @@ def rebuild_all(output: Path) -> int:
         if cl is None:
             log(f"  skip {slug}: unreadable content_list cache")
             continue
-        qa = convert.load_json(sidecar / f"{slug}.qa.json")
-        _atomic_write(output / f"{slug}.md", convert.rebuild_markdown(cl, qa))
+        qa = convert.load_json(sidecar / f"{slug}.qa.json") or {}
+        if defects.get(slug):
+            qa["known_defects"] = defects[slug]
+        hit = _resolve_texref(slug, texref_dirs)
+        if hit:
+            qa["texref"] = f"texref/{hit}"
+        _atomic_write(output / f"{slug}.md", convert.rebuild_markdown(cl, qa, output))
         n += 1
     return n
 

@@ -58,6 +58,52 @@ def _count_types(content_list: list[dict[str, Any]]) -> Counter:
     return Counter(it.get("type", "") for it in content_list)
 
 
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<t[dh][^>]*>", re.I)
+_COLSPAN_RE = re.compile(r"colspan\s*=\s*[\"']?(\d+)", re.I)
+
+
+def _table_widths(content_list: list[dict[str, Any]]) -> list[int]:
+    """Modal column width of each table, page-ordered.
+
+    Width counts colspans, so a header cell spanning two columns counts as two — that is
+    what makes a DROPPED COLUMN visible as a width change rather than hiding inside a
+    ragged row."""
+    out: list[int] = []
+    for it in content_list:
+        if it.get("type") != "table":
+            continue
+        body = str(it.get("table_body") or "")
+        widths = []
+        for row in _ROW_RE.findall(body):
+            w = 0
+            for cell in _CELL_RE.findall(row):
+                m = _COLSPAN_RE.search(cell)
+                w += int(m.group(1)) if m else 1
+            if w:
+                widths.append(w)
+        if widths:
+            out.append(Counter(widths).most_common(1)[0][0])
+    return out
+
+
+def table_shape_divergence(hybrid_cl, pipeline_cl) -> list[dict[str, Any]]:
+    """Tables where the two backends disagree on how many COLUMNS the table has (R11).
+
+    A recognizer that silently drops a whole column — VisionTS lost the entire `Informer`
+    column of its headline results table, 15 values — produces output that is perfectly
+    well-formed HTML and passes every existing guard. The deterministic pipeline backend
+    is an independent opinion on the column count, so a disagreement is the cheapest
+    reliable signal that one of them lost data. Only compared when both backends found the
+    same NUMBER of tables, otherwise the tables cannot be paired up positionally.
+    """
+    hy, pi = _table_widths(hybrid_cl), _table_widths(pipeline_cl)
+    if not hy or len(hy) != len(pi):
+        return []
+    return [{"table_index": i, "hybrid_cols": a, "pipeline_cols": b}
+            for i, (a, b) in enumerate(zip(hy, pi)) if a != b]
+
+
 def compare(
     hybrid_cl: list[dict[str, Any]],
     pipeline_cl: list[dict[str, Any]],
@@ -93,6 +139,7 @@ def compare(
         "pipeline_table_count": pi_types.get("table", 0),
         "hybrid_equation_count": hy_types.get("equation", 0),
         "pipeline_equation_count": pi_types.get("equation", 0),
+        "table_shape_divergence": table_shape_divergence(hybrid_cl, pipeline_cl),
     }
 
 

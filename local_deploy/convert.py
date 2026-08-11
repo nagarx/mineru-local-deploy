@@ -47,6 +47,7 @@ sys.path.insert(0, str(_HERE))
 import postprocess  # noqa: E402
 import coverage as cov  # noqa: E402
 import crosscheck  # noqa: E402
+import repair  # noqa: E402
 
 PDF_SUFFIXES = {".pdf"}
 
@@ -123,12 +124,26 @@ def preflight_models() -> list[str]:
 
 
 def preflight_deps() -> list[str]:
-    """Verify the pdftext/pypdfium2 pair this MinerU actually works with. pdftext 0.7.x /
-    pypdfium2 5.x break the fork twice over: pdf_classify crashes on the removed
-    PdfImage.get_pos (silently degrading EVERY doc to forced-OCR) and '-m txt' dies on a
-    non-iterable PageChars. A uv re-lock regressed exactly this on 2026-07-08 and cost a
-    books run — so refuse to start on a bad pair. The bounds live in pyproject.toml; this
-    catches any install that bypassed them."""
+    """Verify the pdftext/pypdfium2 pair this MinerU actually works with.
+
+    HISTORY — the reason for this guard CHANGED at MinerU 3.4.4, do not "simplify" it back.
+    It originally caught two crashes: pdf_classify dying on the removed PdfImage.get_pos
+    (silently degrading EVERY doc to forced-OCR) and '-m txt' dying on a non-iterable
+    PageChars. A uv re-lock regressed exactly that on 2026-07-08 and cost a books run.
+    Upstream 3.4.4 FIXED BOTH (_get_pdfium_page_object_bounds, _ensure_legacy_chars), so
+    those two symptoms can no longer be used to justify the pin.
+
+    A third, worse reason now keeps it, and this one is silent rather than a crash:
+    pdftext >=0.7 rewrites every UTF-16 surrogate to U+FFFD inside get_chars. Surrogates
+    are not corruption — FPDFText_GetUnicode returns UTF-16 code units, so every codepoint
+    above U+FFFF (the whole Mathematical Alphanumeric Symbols block: the italic x, t, X, θ
+    of maths-heavy papers) legitimately arrives as a PAIR. Measured on one CROSSFORMER
+    page: pdftext 0.6.3 -> 190 recoverable glyphs; 0.7.1 -> 380 U+FFFD and 0 recoverable.
+    The loss happens inside pdftext, so nothing downstream can undo it.
+
+    So the load-bearing check below is BEHAVIOURAL, not a version string: it asserts that
+    this pdftext still hands us the surrogate halves. That keeps working if upstream ever
+    fixes it properly and the pin can be relaxed on evidence rather than on a guess."""
     from importlib import metadata
     problems: list[str] = []
 
@@ -156,15 +171,95 @@ def preflight_deps() -> list[str]:
         except Exception as e:
             problems.append(f"{pkg} missing/unreadable: {e}")
     if not problems:
+        # THE load-bearing check: behaviour, not version strings. A pdftext that pre-empts
+        # surrogates destroys non-BMP maths silently — no crash, no log, just wrong papers.
         try:
-            import pypdfium2 as pdfium   # behavior check, not just version strings
-            if not hasattr(pdfium.PdfImage, "get_pos"):
-                problems.append("pypdfium2.PdfImage.get_pos missing — pdf_classify would silently force-OCR every doc")
+            import inspect
+
+            from pdftext.pdf import chars as _pdftext_chars
+            _src = inspect.getsource(_pdftext_chars.get_chars)
+            if "0xFFFD" in _src.upper().replace("0XFFFD", "0xFFFD"):
+                problems.append(
+                    "this pdftext replaces UTF-16 surrogates with U+FFFD inside get_chars — "
+                    "every non-BMP mathematical variable would be destroyed before MinerU "
+                    "can decode it, and no downstream repair can recover it")
         except Exception as e:
-            problems.append(f"pypdfium2 import failed: {type(e).__name__}: {e}")
+            problems.append(f"could not verify pdftext surrogate behaviour: {type(e).__name__}: {e}")
+        try:
+            import mineru.utils.pdf_text_tool as _ptt  # the fork patch must still be present
+            if not hasattr(_ptt, "_merge_surrogate_pairs"):
+                problems.append(
+                    "mineru/utils/pdf_text_tool.py::_merge_surrogate_pairs is MISSING — the "
+                    "fork patch was lost (most likely in a merge from upstream). Extracted "
+                    "maths variables would silently become '??'. See tests/local_deploy/"
+                    "test_surrogate_pairs.py")
+        except Exception as e:
+            problems.append(f"pdf_text_tool import failed: {type(e).__name__}: {e}")
     if problems:
         problems.append('fix: uv pip install "pdftext==0.6.3" "pypdfium2>=4.30,<5"')
     return problems
+
+
+def make_bbox_salvager(pdf: Path):
+    """Return `(fn, close)` where fn(page_idx, bbox) -> the PDF's OWN text inside that box.
+
+    Used to recover KEPT text-family blocks the VLM handed back empty (R8). content_list
+    bboxes are normalized to 0-1000 with a TOP-LEFT origin, while pypdfium2 wants PDF
+    points with a BOTTOM-LEFT origin — hence the conversion below. Returns (None, noop)
+    if the PDF can't be opened, in which case build_markdown simply can't salvage.
+    """
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(pdf))
+    except Exception as e:
+        log(f"  bbox salvage unavailable for {Path(pdf).name}: {type(e).__name__}: {e}")
+        return None, (lambda: None)
+
+    def salv(page_idx: int, bbox) -> str:
+        page = doc[page_idx]
+        W, H = page.get_width(), page.get_height()
+        x0, y0, x1, y1 = [float(v) for v in bbox]
+        return page.get_textpage().get_text_bounded(
+            left=x0 / 1000 * W, bottom=H - y1 / 1000 * H,
+            right=x1 / 1000 * W, top=H - y0 / 1000 * H) or ""
+
+    return salv, doc.close
+
+
+def make_page_texter(pdf: Path):
+    """Return `(fn, close)` where fn(page_idx) -> the whole text layer of that page.
+    Needed by the repair pass for captions, whose text usually sits OUTSIDE the figure's
+    own bbox."""
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(str(pdf))
+    except Exception:
+        return None, (lambda: None)
+
+    def fn(page_idx: int) -> str:
+        return doc[page_idx].get_textpage().get_text_bounded() or ""
+
+    return fn, doc.close
+
+
+def find_source_pdf(qa: dict[str, Any], output_dir: Path) -> Path | None:
+    """Locate the source PDF for an offline rebuild.
+
+    qa.json records the path the PDF had WHEN IT WAS PROCESSED, but the operator convention
+    is to move drained PDFs out of `inbox/` into `done/`. A rebuild that silently lost the
+    text-layer repairs because the file moved would be a footgun, so also look the file up
+    by name in the track's inbox/ and done/ directories."""
+    src = qa.get("source_pdf")
+    if not src:
+        return None
+    p = Path(src)
+    if p.exists():
+        return p
+    root = output_dir.parent                      # <track>/output -> <track>
+    for sub in ("inbox", "done"):
+        for cand in (root / sub).rglob(p.name):
+            return cand
+    return None
 
 
 def run_backend_phase(input_path: Path, out_dir: Path, backend: str, effort: str,
@@ -219,7 +314,18 @@ def detect_ocr_enabled(middle: Any) -> bool | None:
 
 def analyze_paper(pdf: Path, hybrid_cl: list, pipeline_cl: list | None,
                   hybrid_middle: Any) -> dict[str, Any]:
-    built = postprocess.build_markdown(hybrid_cl, source_name=pdf.stem)
+    salv, close_salv = make_bbox_salvager(pdf)
+    pgtext, close_pg = make_page_texter(pdf)
+    try:
+        # R9/R10: fix '??' math-variable corruption and dropped minus signs BEFORE rendering.
+        # Both defects are already present in the backend's content_list, so no amount of
+        # better rendering can undo them — they must be repaired against the text layer.
+        rep = repair.repair_content_list(hybrid_cl, salv, pgtext)
+        built = postprocess.build_markdown(hybrid_cl, source_name=pdf.stem, salvage_bbox=salv)
+    finally:
+        close_salv()
+        close_pg()
+    built["stats"].update({f"repair_{k}": v for k, v in rep.items()})
     body = built["markdown"]
 
     # Coverage/cross-check run on the BODY (before the QA header is prepended). Both
@@ -252,6 +358,14 @@ def analyze_paper(pdf: Path, hybrid_cl: list, pipeline_cl: list | None,
                            f"{sorted(p['page_idx'] + 1 for p in coverage['suspect_pages'])} "
                            f"(often figure-only pages — verify)")
     # 3) Numeric loss the deterministic pipeline caught but hybrid lacks
+    # R11: the backends disagree on a table's COLUMN COUNT. A recognizer that drops a whole
+    # column still emits valid HTML and passes every other guard (VisionTS lost the entire
+    # `Informer` column of its headline table, 15 values, undetected), so a second opinion
+    # on the shape is the only cheap way to see it.
+    if xcheck and xcheck.get("table_shape_divergence"):
+        d = xcheck["table_shape_divergence"]
+        reasons.append(f"{len(d)} table(s) where the backends disagree on column count "
+                       f"(possible dropped/added column): {d[:5]}")
     if xcheck and xcheck["pipeline_vs_hybrid_numeral_recall"] < XCHECK_NUMERAL_MIN:
         reasons.append(f"cross-check: pipeline has >=2-digit numbers absent from hybrid "
                        f"({xcheck['numbers_in_pipeline_not_hybrid'][:10]})")
@@ -265,6 +379,13 @@ def analyze_paper(pdf: Path, hybrid_cl: list, pipeline_cl: list | None,
                      f"pipeline {xcheck['pipeline_table_count']}) — usually pipeline over-splitting a merged table")
     if ocr_enabled:
         notes.append("body text via VLM OCR (robust to bad/rotated text layers; cross-validated vs the text layer)")
+    if st.get("salvaged_blocks"):
+        notes.append(f"{st['salvaged_blocks']} empty text block(s) ({st['salvaged_chars']} chars) were "
+                     f"recovered from the PDF text layer and marked SALVAGED in the .md — the VLM "
+                     f"returned nothing for those regions")
+    if st.get("empty_blocks_unrecovered"):
+        notes.append(f"{st['empty_blocks_unrecovered']} empty text block(s) had no text layer at their "
+                     f"bbox (figure region, blank area, or a scanned page) — nothing recoverable")
     notes.append("for number-critical certainty, run an adversarial PDF-vs-Markdown audit (LLM, cell-by-cell)")
 
     qa = {
@@ -286,7 +407,7 @@ def analyze_paper(pdf: Path, hybrid_cl: list, pipeline_cl: list | None,
     return {"markdown": markdown, "content_list": hybrid_cl, "qa": qa}
 
 
-def rebuild_markdown(content_list: list, qa: dict | None) -> str:
+def rebuild_markdown(content_list: list, qa: dict | None, output_dir: Path | None = None) -> str:
     """Regenerate a paper's .md from its cached content_list.json (+ qa.json) WITHOUT
     re-running any backend — the .md is a pure function of (body render + QA header).
     Lets `run.py --rebuild` re-emit every .md cheaply when the builder/policy improves,
@@ -295,8 +416,39 @@ def rebuild_markdown(content_list: list, qa: dict | None) -> str:
     if not isinstance(qa.get("pages"), int):   # backfill for caches written before `pages` existed
         qa["pages"] = max((b.get("page_idx", -1) for b in content_list
                            if isinstance(b.get("page_idx"), int)), default=-1) + 1
-    body = postprocess.build_markdown(content_list)["markdown"]
-    return postprocess.build_qa_header(qa) + "\n\n" + body
+    # Salvaging empty blocks needs the source PDF; qa.json records its path. If the PDF has
+    # moved, rebuild still works — it just can't recover (blocks stay dropped, as before).
+    src = find_source_pdf(qa, output_dir) if output_dir else None
+    salv, close_salv = (None, (lambda: None))
+    pgtext, close_pg = (None, (lambda: None))
+    rep = {}
+    if src:
+        salv, close_salv = make_bbox_salvager(src)
+        pgtext, close_pg = make_page_texter(src)
+    try:
+        if salv is not None:
+            rep = repair.repair_content_list(content_list, salv, pgtext)
+        built = postprocess.build_markdown(content_list, salvage_bbox=salv)
+    finally:
+        close_salv()
+        close_pg()
+    st = built["stats"]
+    if rep.get("qq_fixed") or rep.get("signs_fixed"):
+        qa.setdefault("stats", {}).update({f"repair_{k}": v for k, v in rep.items()})
+        note = (f"{rep['qq_fixed']} corrupted math variable(s) and {rep['signs_fixed']} dropped "
+                f"minus sign(s) repaired from the PDF text layer"
+                + (f"; {rep['qq_left']} '??' could not be resolved and are left visible"
+                   if rep.get("qq_left") else ""))
+        notes = [n for n in (qa.get("notes") or []) if not n.startswith("REPAIR:")]
+        qa["notes"] = [f"REPAIR: {note}"] + notes
+    if st.get("salvaged_blocks"):
+        qa.setdefault("stats", {}).update({k: st[k] for k in (
+            "salvaged_blocks", "salvaged_chars", "empty_blocks_benign", "empty_blocks_unrecovered")})
+        note = (f"{st['salvaged_blocks']} empty text block(s) ({st['salvaged_chars']} chars) recovered "
+                f"from the PDF text layer and marked SALVAGED in the .md")
+        notes = [n for n in (qa.get("notes") or []) if not n.startswith("SALVAGE:")]
+        qa["notes"] = [f"SALVAGE: {note}"] + notes
+    return postprocess.build_qa_header(qa) + "\n\n" + built["markdown"]
 
 
 # --- phases ----------------------------------------------------------------------

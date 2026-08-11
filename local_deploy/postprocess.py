@@ -93,6 +93,61 @@ def salvage_html_text(body: Any) -> str:
     return re.sub(r"\s+", " ", txt).strip()
 
 
+# Text-family blocks that the backend can hand back EMPTY. These are KEPT types, so an
+# empty one is a text region the layout model found but the VLM failed to transcribe —
+# i.e. exactly where body text goes missing. Historically these returned None and were
+# counted as "dropped", which made the loss SILENT (the table/equation guards never see
+# them). R8: salvage from the PDF text layer if we can, flag if we can't, never silent.
+_EMPTIABLE: frozenset[str] = TEXT_TYPES | {"list"}
+
+_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
+              "–": "-", "—": "-", "’": "'", "“": '"', "”": '"', "\x02": "", "­": ""}
+
+
+def _cmp_key(s: str) -> str:
+    """Comparison key immune to whitespace, case, ligatures, soft hyphens and punctuation —
+    so 'already present elsewhere?' cannot be fooled by reflow or hyphenation."""
+    for k, v in _LIGATURES.items():
+        s = s.replace(k, v)
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def salvage_is_trustworthy(text: str, pua_threshold: float = 0.05) -> bool:
+    """Guard against salvaging GARBAGE. On a scanned/badly-encoded PDF the text layer is
+    Private-Use-Area gibberish; injecting that would be worse than the empty block it
+    replaces. Mirrors coverage.pua_ratio and its 0.05 threshold so both agree on what
+    "unreliable text layer" means."""
+    if not text:
+        return False
+    pua = sum(1 for ch in text if 0xE000 <= ord(ch) <= 0xF8FF)
+    return (pua / len(text)) <= pua_threshold
+
+
+def empty_kept_block(item: dict[str, Any]) -> bool:
+    """True if this is a KEPT text-family block that renders to nothing."""
+    itype = item.get("type", "")
+    if itype not in _EMPTIABLE:
+        return False
+    if itype == "list":
+        return not [x for x in (item.get("list_items") or []) if str(x).strip()]
+    return not (item.get("text") or "").strip()
+
+
+def _already_present(text: str, corpus_key: str) -> bool:
+    """Is `text` already somewhere in the document? Windowed match on the normalized key.
+    Most empty blocks are benign duplicates (a multi-page reference list is attributed to
+    ONE page and the continuation pages carry empty placeholders) — re-emitting those
+    would duplicate content, so they are dropped quietly and only counted."""
+    n = _cmp_key(text)
+    if not n:
+        return True                      # nothing there at all
+    if len(n) <= 60:
+        return n in corpus_key
+    step = max(40, (len(n) - 40) // 3)
+    wins = [n[i:i + 40] for i in range(0, len(n) - 40, step)][:3]
+    return any(w in corpus_key for w in wins)
+
+
 # --- rendering helpers -----------------------------------------------------------
 
 def _heading_level(item: dict[str, Any]) -> int:
@@ -208,7 +263,52 @@ def render_item(item: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]
 
 # --- whole-document build --------------------------------------------------------
 
-def build_markdown(content_list: list[dict[str, Any]], *, source_name: str = "") -> dict[str, Any]:
+def _recover_empty(item: dict[str, Any], salvage_bbox: Any, corpus_key: str,
+                   stats: dict[str, int]) -> tuple[str | None, list[dict[str, Any]]]:
+    """Deal with a KEPT text-family block that rendered to nothing.
+
+    Three outcomes, none of them a silent drop:
+      recovered — the PDF text layer has text at its bbox that is NOT already in the
+                  document → emit it behind a SALVAGED flag;
+      benign    — the text IS already elsewhere (placeholder for a block attributed to
+                  another page) → drop quietly, counted in `empty_blocks_benign`;
+      unrecovered — nothing in the text layer there (scanned page / genuinely blank
+                  region) → counted in `empty_blocks_unrecovered` and surfaced as a
+                  document-level review signal rather than a noisy inline flag.
+    """
+    page_idx, bbox = item.get("page_idx"), item.get("bbox")
+    itype = item.get("type", "")
+    text = ""
+    if salvage_bbox is not None and bbox and isinstance(page_idx, int):
+        try:
+            text = (salvage_bbox(page_idx, bbox) or "").strip()
+        except Exception:
+            text = ""
+    if text and not salvage_is_trustworthy(text):
+        stats["empty_blocks_unrecovered"] += 1     # text layer is PUA gibberish — refuse it
+        return None, []
+    if text and not _already_present(text, corpus_key):
+        stats["salvaged_blocks"] += 1
+        stats["salvaged_chars"] += len(text)
+        reason = f"empty {itype} block — body text recovered from the PDF text layer"
+        return (f"{_flag_comment('SALVAGED', page_idx, reason)}\n{text}",
+                [{"kind": "salvaged", "page_idx": page_idx, "bbox": bbox, "reason": reason}])
+    if text or salvage_bbox is None:
+        stats["empty_blocks_benign"] += 1
+        return None, []
+    stats["empty_blocks_unrecovered"] += 1
+    return None, []
+
+def build_markdown(content_list: list[dict[str, Any]], *, source_name: str = "",
+                   salvage_bbox: Any = None) -> dict[str, Any]:
+    """Render the content_list to Markdown.
+
+    `salvage_bbox` is an optional callable (page_idx, bbox) -> str returning the PDF's own
+    text layer inside that box. When supplied, a KEPT text-family block that came back
+    empty is recovered from the text layer instead of vanishing (R8). Recovered text is
+    emitted with a SALVAGED flag so the reader knows its provenance; a block whose text is
+    already elsewhere in the document is dropped quietly and merely counted.
+    """
     chunks: list[str] = []
     flags: list[dict[str, Any]] = []
     dropped_types: dict[str, int] = {}
@@ -218,14 +318,29 @@ def build_markdown(content_list: list[dict[str, Any]], *, source_name: str = "")
         "headings": 0, "paragraphs": 0, "equations": 0, "tables": 0,
         "lists": 0, "code": 0, "figure_captions": 0, "references": 0, "footnotes": 0,
         "flagged_tables": 0, "flagged_equations": 0, "flagged_other": 0,
+        "salvaged_blocks": 0, "salvaged_chars": 0, "empty_blocks_benign": 0,
+        "empty_blocks_unrecovered": 0,
     }
 
-    for item in content_list:
+    # Pass 1 — what will the document contain? Needed to tell a genuinely-lost empty block
+    # from a benign placeholder whose text is already rendered elsewhere. render_item is
+    # pure, so rendering twice is safe and cheap.
+    rendered = [render_item(it) for it in content_list]
+    corpus_key = _cmp_key("\n".join(m for m, _ in rendered if m))
+
+    for idx, item in enumerate(content_list):
         stats["blocks_total"] += 1
         itype = item.get("type", "")
-        md, item_flags = render_item(item)
+        md, item_flags = rendered[idx]
+
+        if md is None and empty_kept_block(item):
+            md, extra = _recover_empty(item, salvage_bbox, corpus_key, stats)
+            item_flags = item_flags + extra
+
         flags.extend(item_flags)
         for f in item_flags:
+            if f["kind"] == "salvaged":
+                continue      # a REPAIR, not a defect — counted in stats['salvaged_blocks']
             key = {"table": "flagged_tables", "equation": "flagged_equations"}.get(
                 f["kind"], "flagged_other")
             stats[key] += 1
@@ -301,12 +416,41 @@ def build_qa_header(qa: dict[str, Any]) -> str:
              f" | equations: {st.get('equations', 0)} | tables: {st.get('tables', 0)}")
 
     lines = ["<!-- MINERU-QA", _safe_comment(meta)]
-    if qa.get("needs_review"):
+    # A confirmed audit finding outranks the pipeline's own opinion: a paper whose headline
+    # table lost a column must never announce itself as "clean" just because no guard fired.
+    audited = qa.get("known_defects") or []
+    worst = "high" if any(f.get("severity") == "high" for f in audited) else (
+        "medium" if audited else None)
+    if worst == "high":
+        lines.append("verdict: UNRELIABLE IN PLACES — audited against the source PDF")
+    elif qa.get("needs_review"):
         lines.append("verdict: NEEDS REVIEW")
         for r in qa.get("review_reasons") or []:
             lines.append(_safe_comment(f"  - {r}"))
+    elif worst == "medium":
+        lines.append("verdict: minor audited defects — see below")
     else:
         lines.append("verdict: clean")
+
+    # Where an arXiv paper has an author-source reference (texref), say so immediately after
+    # the verdict. An agent implementing from this file must know that a non-OCR, non-VLM
+    # rendering of the same mathematics exists one directory away, and which of the two wins
+    # when they disagree. Placed high in the header so a truncated read still catches it.
+    if qa.get("texref"):
+        # The path must survive VERBATIM — it is a filesystem key, not prose. _safe_comment
+        # collapses every run of 2+ hyphens, which silently rewrote a real bundle named
+        # "... Finance -- an Application ..." to "... Finance - an Application ..." and left
+        # the pointer resolving to nothing. Only the literal `-->` can close the comment, so
+        # the prose is sanitised as usual and the path is spliced in afterwards through a
+        # hyphen-free placeholder, guarded against that one sequence.
+        path = str(qa["texref"]).replace("-->", "--&gt;")
+        lines.append(_safe_comment(
+            "AUTHOR SOURCE: verbatim mathematics from this paper's own LaTeX is in "
+            "\x00TEXREF\x00/ — equations.md (display equations), inline.md (inline maths + "
+            "notation inventory), paper.flat.tex (full flattened source). It is derived "
+            "from the source, not from the rendered page, so it carries no OCR or "
+            "layout-inference risk. WHERE THIS FILE AND THAT REFERENCE DISAGREE ABOUT "
+            "MATHEMATICS, THE REFERENCE IS AUTHORITATIVE.").replace("\x00TEXREF\x00", path))
 
     trust: list[str] = []
     if "word_recall" in cov:
@@ -322,6 +466,28 @@ def build_qa_header(qa: dict[str, Any]) -> str:
              + st.get("flagged_other", 0))
     if nflag:
         lines.append(f"{nflag} low-confidence block(s) marked inline below with MINERU-FLAG.")
+    # Repairs are provenance, not defects — an agent must know some prose came from the
+    # PDF text layer rather than the VLM, so it travels in the header too (R8).
+    if st.get("salvaged_blocks"):
+        lines.append(f"{st['salvaged_blocks']} empty text block(s) ({st.get('salvaged_chars', 0)} chars) "
+                     f"were RECOVERED from the PDF text layer — marked MINERU-FLAG SALVAGED inline.")
+
+    # Defects an adversarial PDF-vs-Markdown audit CONFIRMED against the source. These are
+    # things this pipeline cannot repair (a table column the recognizer dropped, an altered
+    # digit); the honest thing is to make the agent aware rather than fabricate a fix, so
+    # the finding travels inside the file an agent actually reads.
+    kd = qa.get("known_defects") or []
+    if kd:
+        hi = sum(1 for f in kd if f.get("severity") == "high")
+        lines.append(_safe_comment(
+            f"AUDITED: {len(kd)} verified extraction defect(s) in this paper ({hi} high). "
+            f"DO NOT quote the affected values without checking the source PDF:"))
+        for f in kd[:12]:
+            pg = f.get("page")
+            lines.append(_safe_comment(
+                f"  [{f.get('severity', '?')}] {('p' + str(pg)) if pg else 'see text'}: {f.get('summary', '')}"))
+        if len(kd) > 12:
+            lines.append(f"  … and {len(kd) - 12} more (full list in known_defects.json)")
     lines.append("-->")
     return "\n".join(lines)
 
