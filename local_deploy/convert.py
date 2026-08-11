@@ -328,23 +328,66 @@ def make_page_texter(pdf: Path):
     return fn, doc.close
 
 
+def _same_bytes(paths: list[Path]) -> bool:
+    """True when every candidate is byte-identical (so picking any one is safe)."""
+    import hashlib
+    seen = set()
+    for p in paths:
+        h = hashlib.sha256()
+        try:
+            with open(p, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+        except OSError:
+            return False
+        seen.add(h.hexdigest())
+        if len(seen) > 1:
+            return False
+    return True
+
+
 def find_source_pdf(qa: dict[str, Any], output_dir: Path) -> Path | None:
     """Locate the source PDF for an offline rebuild.
 
     qa.json records the path the PDF had WHEN IT WAS PROCESSED, but the operator convention
-    is to move drained PDFs out of `inbox/` into `done/`. A rebuild that silently lost the
-    text-layer repairs because the file moved would be a footgun, so also look the file up
-    by name in the track's inbox/ and done/ directories."""
+    is to move drained PDFs out of `inbox/` into `done/`, and PDFs from an earlier corpus
+    can live under a SIBLING track entirely. Measured 2026-08-11: 95 of 302 research-paper
+    sidecars could not resolve their PDF, and all 95 were sitting in `_archive_first_corpus/`
+    — a third of the corpus. That matters because a rebuild without the PDF does not merely
+    skip repair and salvage, it silently records the degradation as a *cleaner* result
+    (`salvaged_blocks` and `flags` drop to 0 while real characters are lost).
+
+    Search order: the recorded path, then this track, then sibling tracks. A name that
+    resolves to several candidates is accepted only when they are byte-identical, and
+    refused otherwise — the ledger keys on content hash precisely because names collide.
+    """
     src = qa.get("source_pdf")
     if not src:
         return None
     p = Path(src)
     if p.exists():
         return p
-    root = output_dir.parent                      # <track>/output -> <track>
-    for sub in ("inbox", "done"):
-        for cand in (root / sub).rglob(p.name):
-            return cand
+
+    def _scan(base: Path) -> list[Path]:
+        hits: list[Path] = []
+        for sub in ("inbox", "done", "_originals"):
+            d = base / sub
+            if d.is_dir():
+                hits.extend(d.rglob(p.name))
+        return hits
+
+    track = output_dir.parent                     # <track>/output -> <track>
+    candidates = _scan(track)
+    if not candidates and track.parent.is_dir():  # widen to sibling corpora
+        for sibling in sorted(track.parent.iterdir()):
+            if sibling.is_dir() and sibling != track:
+                candidates.extend(_scan(sibling))
+    if not candidates:
+        return None
+    if len(candidates) == 1 or _same_bytes(candidates):
+        return candidates[0]
+    log(f"  ambiguous source PDF for {p.name}: {len(candidates)} differing candidates "
+        f"— refusing to guess (rebuild will skip repair/salvage)")
     return None
 
 
