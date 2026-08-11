@@ -195,8 +195,87 @@ def preflight_deps() -> list[str]:
                     "test_surrogate_pairs.py")
         except Exception as e:
             problems.append(f"pdf_text_tool import failed: {type(e).__name__}: {e}")
+        problems += preflight_fork_invariants()
     if problems:
         problems.append('fix: uv pip install "pdftext==0.6.3" "pypdfium2>=4.30,<5"')
+    return problems
+
+
+def _lf(s: str) -> str:
+    """Normalise PDFium's CRLF line endings to LF.
+
+    `get_text_bounded()` joins lines with CRLF. `postprocess._recover_empty` emits that
+    text verbatim into the deliverable and `_atomic_write` validates nothing, so 58 of
+    636 shipped `.md` carry 552 raw CR bytes — an unflagged defect in an agent-facing
+    file. It also makes the offline rebuild non-reproducible against the emitted corpus
+    (244/302 match, 58 differ, all CR-only), which is what blocks a byte-identical
+    regression gate. Normalising here fixes both at the source, before any consumer.
+    """
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+#: The render settings the fork patches in. They are SOURCE EDITS with no config path, so
+#: nothing but an explicit assertion can notice their loss.
+EXPECTED_DPI = 300
+EXPECTED_RENDER_DEFAULTS = (300, 4500)
+
+
+def fork_render_settings() -> dict[str, Any]:
+    """The render invariants, for the preflight gate and the run manifest."""
+    import mineru.utils.pdf_image_tools as _pit
+    import mineru.utils.pdf_reader as _pr
+    import mineru
+    return {
+        "mineru_version": getattr(__import__("mineru.version", fromlist=["__version__"]),
+                                  "__version__", "?"),
+        "mineru_path": str(Path(mineru.__file__).resolve().parent),
+        "dpi": getattr(_pit, "DEFAULT_PDF_IMAGE_DPI", None),
+        "page_to_image_defaults": tuple(_pr.page_to_image.__defaults__ or ()),
+    }
+
+
+def preflight_fork_invariants() -> list[str]:
+    """Assert the fork's precision patches are actually loaded.
+
+    ONLY `_merge_surrogate_pairs` was ever checked. The DPI/render-cap patch was
+    protected by nothing, appears in ~0 of 636 QA records, and cannot be reasserted at
+    runtime because MinerU renders in spawned workers that re-import from disk. Losing
+    that one line silently renders everything at 200 DPI — and DPI is the ONE knob that
+    matters, because every other consumer resizes to a fixed input: only the hybrid VLM's
+    per-block crops scale with it (a table crop drops 2048 -> 903 visual tokens). Silent,
+    undetectable after the fact, and it degrades exactly the equations and tables this
+    pipeline exists to get right.
+    """
+    problems: list[str] = []
+    try:
+        s = fork_render_settings()
+    except Exception as e:
+        return [f"could not read fork render settings: {type(e).__name__}: {e}"]
+
+    if s["dpi"] != EXPECTED_DPI:
+        problems.append(
+            f"render DPI is {s['dpi']}, expected {EXPECTED_DPI} — the fork patch in "
+            f"mineru/utils/pdf_image_tools.py was lost. Every page would render at the "
+            f"upstream default and VLM table/equation crops would lose ~half their visual "
+            f"tokens, silently.")
+    if s["page_to_image_defaults"] != EXPECTED_RENDER_DEFAULTS:
+        problems.append(
+            f"pdf_reader.page_to_image defaults are {s['page_to_image_defaults']}, expected "
+            f"{EXPECTED_RENDER_DEFAULTS} — the render-cap patch was lost; 300 DPI would be "
+            f"clipped back on A4/Legal.")
+    if not str(s["mineru_version"]).startswith("3.4"):
+        problems.append(
+            f"mineru {s['mineru_version']} is not 3.4.x. 4.0.x DELETES the pipeline backend "
+            f"and silently aliases '-b pipeline' to hybrid at forced effort=medium, which "
+            f"would remove the dual-backend cross-check without any error.")
+    try:
+        from mineru.cli.backend_options import LOCAL_BACKEND_CHOICES
+        if "pipeline" not in LOCAL_BACKEND_CHOICES:
+            problems.append(
+                "the 'pipeline' backend is gone from this MinerU — the cross-check that "
+                "catches dropped table columns and numeric loss cannot run.")
+    except Exception as e:
+        problems.append(f"could not read backend choices: {type(e).__name__}: {e}")
     return problems
 
 
@@ -219,9 +298,9 @@ def make_bbox_salvager(pdf: Path):
         page = doc[page_idx]
         W, H = page.get_width(), page.get_height()
         x0, y0, x1, y1 = [float(v) for v in bbox]
-        return page.get_textpage().get_text_bounded(
+        return _lf(page.get_textpage().get_text_bounded(
             left=x0 / 1000 * W, bottom=H - y1 / 1000 * H,
-            right=x1 / 1000 * W, top=H - y0 / 1000 * H) or ""
+            right=x1 / 1000 * W, top=H - y0 / 1000 * H) or "")
 
     return salv, doc.close
 
@@ -237,7 +316,7 @@ def make_page_texter(pdf: Path):
         return None, (lambda: None)
 
     def fn(page_idx: int) -> str:
-        return doc[page_idx].get_textpage().get_text_bounded() or ""
+        return _lf(doc[page_idx].get_textpage().get_text_bounded() or "")
 
     return fn, doc.close
 
