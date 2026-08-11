@@ -21,9 +21,14 @@ FAILURES: list[str] = []
 
 
 def check(name: str, text: str, src: str, *, expect: str) -> None:
-    """`expect` is the exact string repair_signs must produce."""
+    """`expect` is what repair_signs must produce WITH MUTATION ENABLED.
+
+    The pass is flag-only by default, so every case is run with `apply=True`: a guard that
+    only holds because mutation is switched off is not a guard. The default-off behaviour
+    is asserted separately at the end.
+    """
     audit: list[dict] = []
-    out, _ = repair.repair_signs(text, src, audit=audit)
+    out, _ = repair.repair_signs(text, src, audit=audit, apply=True)
     if out == expect:
         print(f"  ok   {name}")
         return
@@ -75,19 +80,47 @@ check("an already-signed number is not double-signed",
       "a value of −0.47 here", "a value of −0.47 here",
       expect="a value of −0.47 here")
 
-# --- AUDITABILITY ------------------------------------------------------------------
-print("\nauditability (an unrecorded edit is unrecoverable):")
+# --- MATHS IS NEVER TOUCHED --------------------------------------------------------
+# Every case below was a real shipped corruption before 2026-08-11. R10 is a PROSE
+# defect: inside a math span the minus is markup the VLM emits explicitly, so a bare
+# digit there is an exponent, an index, a numerator or a range endpoint.
+print("\nmaths spans are inviolable (all of these shipped corrupted):")
+
+for name, text, src in [
+    ("\\frac numerator", r"$J = - \frac { 1 } { k } e$", "J = −1/k and a value −1"),
+    ("bracketed expression", r"$\mathbb { R } ^ { ( k + 1 ) d }$", "R^{(k+1)d}, delta −1"),
+    ("subscript index", r"$N _ { 1 } = N _ { 2 }$", "N_1 = N_2, shift −1"),
+    ("en-dash range in maths", r"Layers $2 { - } 4 $ here", "Layers 2-4, delta −4"),
+    ("display maths", r"$$x = 1 + y$$", "x = −1 + y"),
+]:
+    check(name, text, src, expect=text)
+
+check("percent range is not a dropped sign", "spreads of 3% 4%",
+      "spreads 3% to 4%, change −4%", expect="spreads of 3% 4%")
+check("a sign inside an HTML tag counts as already-signed", "<sub>−</sub>0.0028",
+      "value −0.0028 in table", expect="<sub>−</sub>0.0028")
+
+# --- FLAG-ONLY BY DEFAULT ----------------------------------------------------------
+print("\nflag-only by default (value matching cannot prove the TARGET is signed):")
 
 audit: list[dict] = []
-repair.repair_signs("an R2 of 0.47%", "an R2 of −0.47%", audit=audit)
+out, n = repair.repair_signs("an R2 of 0.47%", "an R2 of −0.47%", audit=audit)
+if out == "an R2 of 0.47%" and n == 0 and [a.get("action") for a in audit] == ["flagged"]:
+    print("  ok   a candidate is FLAGGED, not applied, unless mutation is requested")
+else:
+    FAILURES.append("flag-only default")
+    print(f"  FAIL flag-only default: out={out!r} n={n} audit={audit!r}")
+
+audit = []
+repair.repair_signs("an R2 of 0.47%", "an R2 of −0.47%", audit=audit, apply=True)
 if [a.get("action") for a in audit] == ["signed"] and "context" in audit[0]:
-    print("  ok   every applied edit is recorded with its context")
+    print("  ok   an applied edit is recorded with its context")
 else:
     FAILURES.append("signed edits are recorded")
     print(f"  FAIL signed edits are recorded: {audit!r}")
 
 audit = []
-repair.repair_signs("layer shape [2,128]", "shift of −2,128 units", audit=audit)
+repair.repair_signs("layer shape [2,128]", "shift of −2,128 units", audit=audit, apply=True)
 if [a.get("action") for a in audit] == ["declined"]:
     print("  ok   declined candidates are surfaced, not hidden")
 else:

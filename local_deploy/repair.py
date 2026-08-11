@@ -31,6 +31,7 @@ as it was and the block is counted as unrepaired, never guessed at.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Callable
 
@@ -42,6 +43,10 @@ _MATHY = (
     (0x1D6A4, 0x1D6A5),   # dotless i/j
 )
 _MAX_GLYPHS = 6           # a run longer than this is not a variable — refuse to guess
+
+#: Block types the sign pass must never touch. Their content is LaTeX or code, where a
+#: bare digit is an exponent/index/numerator rather than a signed quantity.
+_NO_SIGN_TYPES = {"equation", "code", "table"}
 _ANCHOR = 18              # letters/digits of context used to locate a defect in the PDF text
 
 
@@ -171,11 +176,45 @@ def repair_qq(text: str, src: str) -> tuple[str, int, int]:
 _NEG = re.compile(r"[−–](\d[\d,]*\.?\d*)")
 
 
+# Regions where a "missing" minus is NOT a dropped sign. R10 is a PROSE defect: the sign
+# sits beside inline maths ("$R^{2}$ of -0.47%"), never inside it. Inside a math span the
+# minus is markup the VLM emits explicitly, so any digit there belongs to an exponent, an
+# index, a fraction, or a range — signing it corrupts the expression. Measured 2026-08-11:
+# 67 documents / 154 sign edits under the previous rules, producing shipped damage such as
+# `\frac {-1}{2}`, `( k + -1 ) d`, `N _ { -1 }` and `S _ {-1 -1}`.
+# HTML tags are protected for the same reason: a sign can live in a <sub> beside the number.
+_PROTECTED = re.compile(
+    r"\$\$.*?\$\$"          # display maths
+    r"|\$[^$]*\$"           # inline maths
+    r"|\\\[.*?\\\]"         # \[ ... \]
+    r"|\\\(.*?\\\)"         # \( ... \)
+    r"|<[^>]*>",            # any HTML tag
+    re.S,
+)
+
+
+def _protected_ranges(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _PROTECTED.finditer(text)]
+
+
+def _in_protected(pos: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(a <= pos < b for a, b in ranges)
+
+
+def _strip_tags(s: str) -> str:
+    """Drop HTML tags so the already-signed test sees the sign, not the markup.
+
+    A table cell rendered as `<sub>-</sub>0.0028` carries its minus INSIDE a tag; the
+    plain endswith test saw '>' and signed the number a second time.
+    """
+    return re.sub(r"<[^>]*>", "", s)
+
+
 def _digit_near(text: str, i: int, step: int) -> bool:
     """Walk away from a match past spaces; report whether a digit sits on that side.
 
-    Also steps over ONE '.' when a digit sits beyond it, so '0 . 1' reads as a spaced
-    numeral while an end-of-sentence '.' in prose does not.
+    Steps over ONE '.' or '%' when a digit sits beyond it, so '0 . 1' reads as a spaced
+    numeral and '3% 4%' reads as a range — while an end-of-sentence '.' in prose does not.
     """
     n = len(text)
     while 0 <= i < n and text[i] == " ":
@@ -184,7 +223,7 @@ def _digit_near(text: str, i: int, step: int) -> bool:
         return False
     if text[i].isdigit():
         return True
-    if text[i] == ".":
+    if text[i] in ".%":
         j = i + step
         while 0 <= j < n and text[j] == " ":
             j += step
@@ -238,8 +277,30 @@ def _is_spaced_numeral_fragment(text: str, start: int, end: int) -> bool:
     return _digit_near(text, start - 1, -1) or _digit_near(text, end, +1)
 
 
+#: Whether the sign pass is allowed to MUTATE text, or may only flag candidates.
+#:
+#: Default FLAG-ONLY, and that is a deliberate reversal. `repair_signs` matches on VALUE:
+#: it finds a number that is negative in the PDF text layer and signs every unsigned
+#: occurrence of those digits in the block. The "every occurrence in the source is
+#: negative" guard constrains the EVIDENCE but says nothing about the TARGET, so the same
+#: digits in a different role are signed too.
+#:
+#: Measured over all 636 documents on 2026-08-11, after the math-span, ordinal, bracket,
+#: range and spaced-numeral guards were added, 67 edits remained across 26 documents:
+#: ~8 genuinely correct (a lost minus in `h<sub>t 1</sub>`), 8+ plainly wrong (index page
+#: ranges `269-271`, the year `2011`), and ~50 unresolvable without reading the paper.
+#: A ~10-20% true-positive rate is not acceptable for a silent, unrecoverable change to a
+#: numeric value in a research paper — and this module's own contract already forbids it:
+#: "if the evidence is not unambiguous the text is left exactly as it was ... never
+#: guessed at". Flagging loses nothing: every candidate is recorded with its context, so
+#: an audit can still act on the 8 real ones.
+#:
+#: Set MINERU_APPLY_SIGN_REPAIR=1 to restore mutation.
+APPLY_SIGN_REPAIR = os.getenv("MINERU_APPLY_SIGN_REPAIR", "").strip().lower() in {"1", "true", "yes"}
+
+
 def repair_signs(text: str, src: str, require_unique: bool = False,
-                 audit: list | None = None) -> tuple[str, int]:
+                 audit: list | None = None, apply: bool | None = None) -> tuple[str, int]:
     """Re-attach a U+2212 minus the VLM dropped from a negative number in prose.
 
     Pass `audit` to collect one record per edit. Signing a number is the most
@@ -257,10 +318,12 @@ def repair_signs(text: str, src: str, require_unique: bool = False,
       (b) the block text has it unsigned.
     Both conditions are evaluated per block, which keeps collisions rare.
     """
+    do_apply = APPLY_SIGN_REPAIR if apply is None else apply
     if not src or ("−" not in src and "–" not in src):
         return text, 0
     src_f = _flat(src)
-    n = 0
+    protected = _protected_ranges(text)
+    n = flagged = 0
     for val in dict.fromkeys(m.group(1) for m in _NEG.finditer(src_f)):
         v = re.escape(val)
         total = len(re.findall(r"(?<![\d.])" + v + r"(?![\d])", src_f))
@@ -275,9 +338,11 @@ def repair_signs(text: str, src: str, require_unique: bool = False,
         # sign every unsigned copy in the block (the source says they are all negative)
         out, pos, hit = [], 0, 0
         for m in re.finditer(r"(?<![\d.])" + v + r"(?![\d])", text):
-            before = text[:m.start()].rstrip()
+            if _in_protected(m.start(), protected):
+                continue                      # inside maths or an HTML tag — not a dropped sign
+            before = _strip_tags(text[:m.start()]).rstrip()
             if before.endswith(("-", "−", "–")):
-                continue                      # already signed
+                continue                      # already signed (tags stripped first)
             if _is_spaced_numeral_fragment(text, m.start(), m.end()):
                 continue                      # a digit of `0 . 0 0 1`, not a number (C2)
             if _follows_ordinal_label(text, m.start()):
@@ -288,6 +353,13 @@ def repair_signs(text: str, src: str, require_unique: bool = False,
                     audit.append({"value": val, "context": ctx,
                                   "action": "declined", "reason": "inside brackets — "
                                   "shape/index/citation or a real interval; ambiguous"})
+                continue
+            if not do_apply:
+                if audit is not None:
+                    audit.append({"value": val, "context": ctx, "action": "flagged",
+                                  "reason": "a minus may have been dropped here; "
+                                            "value-based matching cannot prove it"})
+                flagged += 1
                 continue
             if audit is not None:             # never mutate content silently
                 audit.append({"value": val, "context": ctx, "action": "signed"})
@@ -315,7 +387,8 @@ def repair_content_list(content_list: list[dict[str, Any]],
     # written, and it is therefore unrecoverable if unrecorded — the 2026-08-11 audit found
     # two destroyed numeric literals shipping under `verdict: clean`. Never silent again.
     st: dict[str, Any] = {"qq_fixed": 0, "qq_left": 0, "signs_fixed": 0,
-                          "blocks_repaired": 0, "signs_declined": 0, "sign_edits": []}
+                          "blocks_repaired": 0, "signs_declined": 0,
+                          "signs_flagged": 0, "sign_edits": []}
     if page_text is None:
         return st
     for b in content_list:
@@ -368,7 +441,12 @@ def repair_content_list(content_list: list[dict[str, Any]],
             # figure or section reference, and no uniqueness test can tell those apart —
             # soundness requires the evidence and the target to come from the same region.
             # Signs the bbox cannot justify are left alone and recorded in known_defects.
-            srcs = _srcs()
+            # R10 is a PROSE defect (see this module's docstring): signs survive inside
+            # table cells and equations, and only body prose loses them. Running the sign
+            # pass over an `equation` block therefore has no upside and a proven downside —
+            # it signed digits inside \frac, subscripts and index expressions. Restrict it
+            # to the block types where the defect actually occurs.
+            srcs = _srcs() if b.get("type") not in _NO_SIGN_TYPES else []
             if srcs:
                 audit: list[dict[str, Any]] = []
                 new, sg = repair_signs(new, srcs[0], audit=audit)
@@ -379,6 +457,8 @@ def repair_content_list(content_list: list[dict[str, Any]],
                     st["sign_edits"].append(rec)
                     if rec.get("action") == "declined":
                         st["signs_declined"] += 1
+                    elif rec.get("action") == "flagged":
+                        st["signs_flagged"] += 1
             st["qq_left"] += len(re.findall(r"(?:\?\?)+", new))
             if new != v:
                 b[field] = new
