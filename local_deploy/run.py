@@ -58,10 +58,15 @@ def _pages_of(content_list: list) -> int:
     return max((b.get("page_idx", -1) for b in content_list), default=-1) + 1
 
 
-def _stage_and_run(work: Path, items: list[dict], cfg: dict) -> tuple[Path, Path, bool]:
+def _stage_and_run(work: Path, items: list[dict], cfg: dict) -> tuple[Path, Path, bool, dict]:
     """Symlink items as <id>.pdf into a fresh staging dir and run both backends over it.
-    Returns (hy_dir, pi_dir, spawn_ok). spawn_ok=False means the mineru process couldn't
-    even start (missing binary / OS spawn error) — never propagates."""
+
+    Returns (hy_dir, pi_dir, spawn_ok, rcs). spawn_ok=False means the mineru process
+    couldn't even start (missing binary / OS spawn error) — never propagates. `rcs` maps
+    each phase to its exit code; it used to be computed and thrown away, so a backend
+    that died after emitting partial output looked exactly like a clean success and the
+    ledger recorded the misleading "backend produced no content_list".
+    """
     staging, hy_dir, pi_dir = work / "staging", work / "hybrid", work / "pipeline"
     for d in (staging, hy_dir, pi_dir):
         shutil.rmtree(d, ignore_errors=True)
@@ -69,14 +74,19 @@ def _stage_and_run(work: Path, items: list[dict], cfg: dict) -> tuple[Path, Path
     for it in items:
         (staging / f"{it['id']}.pdf").symlink_to(Path(it["source_path"]).resolve())
     spawn_ok = True
+    rcs: dict[str, int] = {}
     try:
-        convert.run_backend_phase(staging, hy_dir, "hybrid-engine", cfg["effort"], cfg["window"], cfg["method"])
-        convert.run_backend_phase(staging, pi_dir, "pipeline", cfg["effort"], cfg["window"], "auto")
+        rcs["hybrid"] = convert.run_backend_phase(
+            staging, hy_dir, "hybrid-engine", cfg["effort"], cfg["window"], cfg["method"])
+        rcs["pipeline"] = convert.run_backend_phase(
+            staging, pi_dir, "pipeline", cfg["effort"], cfg["window"], "auto")
     except Exception as e:   # OS couldn't spawn mineru (missing binary, etc.)
         log(f"  backend could not start: {type(e).__name__}: {e}")
+        rcs.setdefault("hybrid", convert.RC_SPAWN_FAILED)
+        rcs.setdefault("pipeline", convert.RC_SPAWN_FAILED)
         spawn_ok = False
     shutil.rmtree(staging, ignore_errors=True)
-    return hy_dir, pi_dir, spawn_ok
+    return hy_dir, pi_dir, spawn_ok, rcs
 
 
 def _build_paper(lib: library.Library, output: Path, hy_dir: Path, pi_dir: Path,
@@ -201,7 +211,10 @@ def process_cycle(lib: library.Library, root: Path, batch_size: int, cfg: dict) 
         return len(batch)
 
     log(f"cycle: processing {len(items)} PDF(s)")
-    hy_dir, pi_dir, spawn_ok = _stage_and_run(work, items, cfg)
+    hy_dir, pi_dir, spawn_ok, rcs = _stage_and_run(work, items, cfg)
+    # A non-zero rc is now load-bearing: it is the ONLY signal distinguishing "the
+    # backend died mid-batch" from "these PDFs legitimately produced nothing".
+    rc_note = ", ".join(f"{k} rc={v}" for k, v in rcs.items() if v != 0)
 
     no_output: list[dict] = []
     for it in items:
@@ -216,15 +229,20 @@ def process_cycle(lib: library.Library, root: Path, batch_size: int, cfg: dict) 
             log(f"{len(no_output)} paper(s) had no backend output — re-running each in "
                 f"isolation to spare their batch-mates")
             for it in no_output:
-                h2, p2, ok2 = _stage_and_run(work, [it], cfg)
+                h2, p2, ok2, rcs2 = _stage_and_run(work, [it], cfg)
                 if _build_paper(lib, output, h2, p2, it["id"], it) == "no_output":
+                    why = ", ".join(f"{k} rc={v}" for k, v in rcs2.items() if v != 0)
                     lib.mark_failed(it["id"], "no content_list even in isolation "
-                                              "(unparseable/poison PDF or backend crash)")
-                    log(f"  FAILED {it['slug']}: no output in isolation")
+                                              "(unparseable/poison PDF or backend crash)"
+                                              + (f" [{why}]" if why else ""))
+                    log(f"  FAILED {it['slug']}: no output in isolation"
+                        + (f" ({why})" if why else ""))
         else:
             for it in no_output:
-                lib.mark_failed(it["id"], "backend produced no content_list")
-                log(f"  FAILED {it['slug']}: no backend output")
+                lib.mark_failed(it["id"], "backend produced no content_list"
+                                          + (f" [{rc_note}]" if rc_note else ""))
+                log(f"  FAILED {it['slug']}: no backend output"
+                    + (f" ({rc_note})" if rc_note else ""))
 
     shutil.rmtree(work / "hybrid", ignore_errors=True)
     shutil.rmtree(work / "pipeline", ignore_errors=True)
@@ -267,6 +285,12 @@ def main() -> None:
         missing = lib.verify_outputs()
         print("MISSING outputs for 'done' papers:", missing or "none — all accounted for")
         print(json.dumps(lib.counts(), indent=2))
+        lib.close()
+        # Exit non-zero so this can actually gate something. It previously returned 0
+        # even with every output missing, which is why _archive_first_corpus sat 137/137
+        # broken for a month with nothing noticing.
+        if missing:
+            raise SystemExit(f"{len(missing)} 'done' paper(s) have no .md on disk")
         return
 
     # single-instance guard: two concurrent runs on one root would double-process.

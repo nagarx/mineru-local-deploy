@@ -193,6 +193,13 @@ def preflight_deps() -> list[str]:
                     "fork patch was lost (most likely in a merge from upstream). Extracted "
                     "maths variables would silently become '??'. See tests/local_deploy/"
                     "test_surrogate_pairs.py")
+            if not hasattr(_ptt, "_is_same_glyph_expansion"):
+                problems.append(
+                    "mineru/utils/pdf_text_tool.py::_is_same_glyph_expansion is MISSING — the "
+                    "ligature fork patch was lost (most likely in a merge from upstream). "
+                    "Every ff/fi/fl/tt ligature would silently lose a character "
+                    "('different' -> 'diferent'), which affected 42% of the corpus before "
+                    "the fix. See tests/local_deploy/test_ligature_dedup.py")
         except Exception as e:
             problems.append(f"pdf_text_tool import failed: {type(e).__name__}: {e}")
         problems += preflight_fork_invariants()
@@ -341,22 +348,74 @@ def find_source_pdf(qa: dict[str, Any], output_dir: Path) -> Path | None:
     return None
 
 
+#: MinerU's own client deadline is 3600 s and `plan_tasks` emits ONE task per document
+#: for hybrid (mineru/cli/client.py:661-664), so the wall is per-document — a long book
+#: fails deterministically while the server is still working correctly, and the client
+#: reports that as a parse failure. A 3486 s near-miss (3.2% margin) is already in the
+#: logs. local_deploy never set any of these. They are CEILINGS, not waits, so they are
+#: generous; PHASE_TIMEOUT_SECONDS below is the real guard. `setdefault` semantics: an
+#: operator who exported a value meant it, and the effective values are logged.
+BACKEND_TIMEOUT_ENV = {
+    "MINERU_TASK_RESULT_TIMEOUT_SECONDS": "86400",           # 24 h per document
+    "MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS": "3600",   # result/ZIP retrieval
+    "MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS": "900",       # cold MPS model load
+    "MINERU_PDF_RENDER_TIMEOUT": "1800",                     # large/complex pages
+}
+
+#: Backstop for a genuinely wedged backend, which would otherwise block the cycle
+#: forever while holding the run lock. Deliberately far above the measured worst case
+#: (7474 s for a batch of 8) so it never fires on slow-but-healthy work.
+PHASE_TIMEOUT_SECONDS = int(os.getenv("LOCAL_DEPLOY_PHASE_TIMEOUT_SECONDS", str(12 * 3600)))
+
+RC_TIMEOUT = -9        #: sentinel rc: our own phase timeout fired
+RC_SPAWN_FAILED = -1   #: sentinel rc: the backend process could not be started
+
+
+def build_backend_env(window: int) -> dict[str, str]:
+    """The environment a backend subprocess runs under, as a single auditable place.
+
+    Returned rather than applied so the run manifest can record exactly what was in
+    effect — MinerU's env vars OVERRIDE its CLI flags (config_reader.py:140-149 returns
+    the env value unconditionally when set), so a stale export silently changes a run.
+    """
+    env = dict(os.environ)
+    env["MINERU_MODEL_SOURCE"] = "local"
+    # The CLI flag must win over an ambient value: `--window` was previously applied with
+    # setdefault, so an exported MINERU_PROCESSING_WINDOW_SIZE silently beat the flag.
+    env["MINERU_PROCESSING_WINDOW_SIZE"] = str(window)
+    for key, value in BACKEND_TIMEOUT_ENV.items():
+        env.setdefault(key, value)
+    return env
+
+
 def run_backend_phase(input_path: Path, out_dir: Path, backend: str, effort: str,
                       window: int, method: str = "auto") -> int:
     """Run one backend over the whole input as a subprocess (models load once, then
-    the process exits and frees all memory before the next phase)."""
+    the process exits and frees all memory before the next phase).
+
+    Returns the process rc, or a sentinel (RC_TIMEOUT / RC_SPAWN_FAILED). The caller
+    MUST inspect it: a non-zero rc used to be discarded, so a backend that died after
+    emitting partial output was indistinguishable from a clean success.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [mineru_bin(), "-p", str(input_path), "-o", str(out_dir),
            "-b", backend, "-f", "true", "-t", "true", "-m", method]
     if backend.startswith("hybrid"):
         cmd += ["--effort", effort, "--image-analysis", "false"]
-    env = dict(os.environ)
-    env["MINERU_MODEL_SOURCE"] = "local"
-    env.setdefault("MINERU_PROCESSING_WINDOW_SIZE", str(window))
+    env = build_backend_env(window)
     log(f"phase {backend}: {' '.join(cmd)}")
+    log(f"  timeouts: phase={PHASE_TIMEOUT_SECONDS}s "
+        + " ".join(f"{k.replace('MINERU_', '')}={env[k]}" for k in BACKEND_TIMEOUT_ENV))
     t0 = time.time()
-    rc = subprocess.run(cmd, env=env).returncode
+    try:
+        rc = subprocess.run(cmd, env=env, timeout=PHASE_TIMEOUT_SECONDS).returncode
+    except subprocess.TimeoutExpired:
+        rc = RC_TIMEOUT
+        log(f"phase {backend} TIMED OUT after {PHASE_TIMEOUT_SECONDS}s and was killed "
+            f"(a spawned mineru-api child may survive — check with `pgrep -f mineru`)")
     log(f"phase {backend} finished rc={rc} in {time.time()-t0:.0f}s")
+    if rc != 0:
+        log(f"  !! {backend} exited non-zero — any output it produced is SUSPECT")
     return rc
 
 

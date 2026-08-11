@@ -342,6 +342,46 @@ def _legacy_chars_to_page_chars(chars):
     )
 
 
+def _is_same_glyph_expansion(
+    deduplicated_chars: list[dict[str, Any]],
+    current_char: dict[str, Any],
+    current_bbox: tuple[float, ...],
+) -> bool:
+    """FORK PATCH — a multi-character ligature glyph is NOT a duplicated character.
+
+    A ligature (ff, fi, fl, ffi, ffl, tt, ...) is ONE glyph whose ToUnicode mapping
+    expands to SEVERAL characters. PDFium reports every constituent, and because they
+    all originate from that single glyph they carry the *same* bbox. The near-identical
+    test below therefore reads the second 'f' of "different" as a duplicate of the first
+    and deletes it, emitting "diferent" — silently, with no counter and no warning.
+
+    Measured on a 636-document corpus (2026-08-11): 267 files (42%), 8,618 occurrences,
+    exclusively on the native-text path (267/551 native vs 0/85 VLM-OCR). It is NOT
+    f-only: 'tt' collapses in 164 further files ("attention" -> "atention").
+
+    The ligature signature is exact and was measured, not assumed: the constituent is
+    IMMEDIATELY adjacent in the kept stream, carries an identical visible signature, and
+    its bbox is bit-for-bit equal (delta [0.0, 0.0, 0.0, 0.0]). Over 10 sampled PDFs x 5
+    pages, 106 of 106 deletions matched exactly this signature and none matched anything
+    else — so refusing them costs no genuine deduplication.
+
+    The two real duplicate classes this function exists for are untouched: a text-layer
+    boundary duplicate is NON-ADJACENT (it re-emits a character seen earlier elsewhere),
+    and a diagonal shadow copy is OFFSET (handled by _is_adjacent_offset_duplicate_char).
+
+    Deliberately conservative: keeping a genuine duplicate yields a visible, rare "ff"
+    artifact, whereas deleting a ligature constituent silently corrupts running prose.
+    """
+    if not deduplicated_chars:
+        return False
+    previous_char = deduplicated_chars[-1]
+    if _get_visible_char_signature(previous_char) != _get_visible_char_signature(
+        current_char
+    ):
+        return False
+    return _get_char_bbox_coords(previous_char) == tuple(current_bbox)
+
+
 def _deduplicate_near_identical_chars(
     chars: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -373,6 +413,8 @@ def _deduplicate_near_identical_chars(
                 bbox_bucket_key
             )
             for seen_bbox in visible_char_bbox_buckets.get(neighbor_bucket_key, [])
+        ) and not _is_same_glyph_expansion(  # FORK PATCH: keep ligature constituents
+            deduplicated_chars, char, bbox_coords
         ):
             continue
         visible_char_bbox_buckets.setdefault(bbox_bucket_key, []).append(bbox_coords)
