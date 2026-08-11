@@ -90,15 +90,39 @@ Anything suspicious lands in a per-paper `*.qa.json` and the batch `report.md` f
 ## Tracking upstream MinerU
 
 We run a **fork**, currently merged up to upstream **3.4.4** (`git remote` `upstream` →
-`opendatalab/MinerU`). The fork surface on upstream code is deliberately tiny — three files —
-because `local_deploy/` imports **nothing** from `mineru`; it shells out to the `mineru` CLI.
-Keep it that way: it is what makes upstream merges cheap.
+`opendatalab/MinerU`). The fork surface on upstream code is deliberately tiny — three files,
+four patches — because `local_deploy/` does all its real work by shelling out to the `mineru`
+CLI rather than calling its API. Keep it that way: it is what makes upstream merges cheap.
+
+The one exception is deliberate: **preflight imports `mineru` to introspect it** — to assert
+the fork patches are present, the render DPI is 300, the version is 3.4.x, and the `pipeline`
+backend still exists. That is a read-only invariant check, not a coupling to MinerU's
+internals, and it exists precisely so a lost patch fails loudly instead of silently degrading
+every extraction.
 
 | Upstream file | Our change | Merge risk |
 |---|---|---|
 | `mineru/utils/pdf_text_tool.py` | `_merge_surrogate_pairs` | **High** — upstream edits this file; re-apply every time |
+| `mineru/utils/pdf_text_tool.py` | `_is_same_glyph_expansion` (ligature fix) | **High** — same file; re-apply every time |
 | `mineru/utils/pdf_image_tools.py`, `mineru/utils/pdf_reader.py` | DPI 200→300, cap 3500→4500 | Low — upstream rarely touches these |
 | `pyproject.toml` | tighter `pdftext`/`pypdfium2` bounds | **Always conflicts** — resolve in *our* favour |
+
+**Ligature fix (2026-08-11).** Upstream's `_deduplicate_near_identical_chars` deletes a
+visible character whose same character was already seen at a near-identical bbox. A
+ligature is **one glyph** whose ToUnicode expands to several characters, all carrying that
+glyph's bbox — so the second `f` of "different" was deleted, emitting `diferent`. Measured
+before the fix: **267 of 636 documents (42%), 8,618 occurrences**, and exclusively on the
+native-text path (267/551 native vs **0/85** VLM-OCR). It is **not f-only** — `tt` collapsed
+in 164 more files (`attention` → `atention`). `_is_same_glyph_expansion` refuses the
+deletion only for a constituent that is immediately adjacent in the kept stream with a
+**bit-for-bit equal** bbox, which is the measured ligature signature; merely *near*-identical
+bboxes and non-adjacent repeats still dedupe, so upstream's two real duplicate classes are
+untouched. Report: `upstream_reports/mineru-ligature-dedup.md`.
+
+**Both `pdf_text_tool.py` patches are asserted by `convert.preflight_deps()`** and pinned by
+`tests/local_deploy/test_surrogate_pairs.py` and `test_ligature_dedup.py` — run both after
+any merge. The DPI/render-cap patch is now asserted too (`preflight_fork_invariants()`); it
+previously had **no** guard at all, so losing it silently halved VLM table-crop resolution.
 
 **To merge a new upstream release:**
 ```bash
@@ -106,8 +130,14 @@ git fetch upstream --tags
 git merge upstream/master              # expect exactly one conflict: pyproject.toml
 # keep OUR pdftext/pypdfium2 bounds, take upstream's other dependency changes
 .venv/bin/python tests/local_deploy/test_surrogate_pairs.py   # MUST pass
+.venv/bin/python tests/local_deploy/test_ligature_dedup.py    # MUST pass
 .venv/bin/python -c "import sys;sys.path.insert(0,'local_deploy');from convert import preflight_deps;print(preflight_deps() or 'OK')"
 ```
+
+> **As of 2026-08-11 there is nothing to merge.** Verified live against the GitHub API and
+> PyPI: 3.4.4 (2026-07-10) is the latest stable, `upstream/master` is byte-identical to our
+> merge base (`ahead_by: 0, behind_by: 0`), and the 3.x line is frozen — all activity is on
+> `next`, which is 4.0. Treat this runbook as dormant rather than routine.
 Then re-extract **one** maths-heavy paper and diff it against the previous output before
 trusting a batch run.
 
