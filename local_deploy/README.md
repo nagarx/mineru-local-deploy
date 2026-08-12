@@ -112,9 +112,22 @@ every extraction.
 visible character whose same character was already seen at a near-identical bbox. A
 ligature is **one glyph** whose ToUnicode expands to several characters, all carrying that
 glyph's bbox — so the second `f` of "different" was deleted, emitting `diferent`. Measured
-before the fix: **267 of 636 documents (42%), 8,618 occurrences**, and exclusively on the
-native-text path (267/551 native vs **0/85** VLM-OCR). It is **not f-only** — `tt` collapsed
-in 164 more files (`attention` → `atention`). `_is_same_glyph_expansion` refuses the
+before the fix: **267 of 636 documents (42%)** — and, robustly, **exclusively on the
+native-text path: 267/551 native vs 0/85 VLM-OCR**, a total correlation reproduced
+independently with different word lists.
+
+> **Occurrence counts, corrected 2026-08-12.** Do not quote a single total. At least seven
+> mutually inconsistent figures are on record (7,340 / 8,618 / 10,363 / 10,728 / 13,030 /
+> 13,208 / 15,560) because each measurement used a different word list and none said so.
+> The file *count* is stable at 265–277; the **split by parse path is the robust claim**.
+> The measurement scripts are preserved at `tools/verification/v_lig{,2,3}.py`.
+>
+> `tt` collapse is real but **rare: 7 files / 9 occurrences**, not the "164 files" stated
+> earlier — that regex included the ordinary English word "matter", which alone matched 157
+> files. The patch is justified by the f-family numbers; `tt` shows the mechanism is not
+> f-specific, not that it is common.
+
+`_is_same_glyph_expansion` refuses the
 deletion only for a constituent that is immediately adjacent in the kept stream with a
 **bit-for-bit equal** bbox, which is the measured ligature signature; merely *near*-identical
 bboxes and non-adjacent repeats still dedupe, so upstream's two real duplicate classes are

@@ -357,7 +357,11 @@ def _is_same_glyph_expansion(
 
     Measured on a 636-document corpus (2026-08-11): 267 files (42%), 8,618 occurrences,
     exclusively on the native-text path (267/551 native vs 0/85 VLM-OCR). It is NOT
-    f-only: 'tt' collapses in 164 further files ("attention" -> "atention").
+    f-only, though the non-f tail is SMALL: 'tt' collapses in 7 further files / 9
+    occurrences ("attention" -> "atention"). CORRECTED 2026-08-12 — an earlier count of
+    "164 files" was a measurement error whose regex included the ordinary English word
+    "matter", which alone matched 157 files. The patch is justified by the f-family
+    numbers; the tt case shows the mechanism is not f-specific, not that it is common.
 
     The ligature signature is exact and was measured, not assumed: the constituent is
     IMMEDIATELY adjacent in the kept stream, carries an identical visible signature, and

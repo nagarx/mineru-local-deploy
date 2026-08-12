@@ -6,7 +6,9 @@ character was already seen at a near-identical bbox. A ligature is ONE glyph who
 ToUnicode expands to SEVERAL characters, all carrying that glyph's bbox — so the second
 'f' of "different" was deleted, emitting "diferent". Measured over 636 documents on
 2026-08-11: 267 files (42%), 8,618 occurrences, 267/551 native-text vs 0/85 VLM-OCR.
-Not f-only: 'tt' collapsed in 164 further files ("attention" -> "atention").
+Not f-only, but the non-f tail is small: 'tt' collapses in 7 further files / 9 occurrences
+("attention" -> "atention"). A prior "164 files" figure was a measurement error — its regex
+included the ordinary English word "matter", which alone matched 157 files.
 
 `_is_same_glyph_expansion` refuses exactly that deletion. This file fails loudly if the
 patch is lost in an upstream merge, or if its discriminator stops working.
