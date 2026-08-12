@@ -26,7 +26,8 @@ Then, offline, it builds the Markdown from the hybrid `content_list.json` and ru
 | Cross-check (R4/R6) | numbers/words the deterministic pipeline found but hybrid lacks are flagged |
 | OCR-misclass (R5) | a born-digital PDF parsed as "scanned" is flagged (consider `-m txt`) |
 | Empty-block salvage (R8) | a KEPT text block the VLM returned EMPTY is recovered from the PDF text layer via its bbox and marked `SALVAGED` — it used to drop silently, because the flag machinery only covered tables/equations/code |
-| Text-layer repair (R9/R10) | `??` where the VLM could not emit a maths glyph, and minus signs dropped from negative numbers in prose, are restored from the text layer (`repair.py`) |
+| Text-layer repair (R9) | `??` where the VLM could not emit a maths glyph is restored from the text layer (`repair.py`) |
+| Sign FLAG (R10) | **Changed 2026-08-12: this no longer repairs, it flags.** A minus dropped from a negative number used to be restored automatically. Value-based matching constrains the *evidence* but never the *target*, so it signed digits that were never negative — measured over 636 documents, ~10–20% of its edits were correct and it shipped `\frac {−1}{2}`, `N _ { −1 }`, the year `2011` and page ranges. Candidates are now recorded in `stats.sign_edits` with their context and counted in `signs_flagged`; nothing is applied. `MINERU_APPLY_SIGN_REPAIR=1` restores mutation. |
 | Table shape (R11) | the two backends disagreeing on a table's **column count** is flagged — a recognizer that drops a whole column still emits valid HTML and passes every other guard |
 
 Anything suspicious lands in a per-paper `*.qa.json` and the batch `report.md` for human review.

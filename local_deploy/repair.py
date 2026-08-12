@@ -20,6 +20,14 @@ rendering, because the damage is already present in the VLM's `content_list`:
       becomes 0.47% and the result's SIGN INVERTS. Signs survive inside table cells; only
       prose is affected.
 
+      CHANGED 2026-08-12 — R10 NO LONGER REPAIRS BY DEFAULT, IT FLAGS. The pass matches on
+      VALUE: it finds a number that is negative in the text layer and signs every unsigned
+      occurrence of those digits in the block. That constrains the EVIDENCE and never the
+      TARGET, so the same digits in another role were signed too. Measured over all 636
+      documents it shipped `\frac {-1}{2}`, `( k + -1 ) d`, `N _ { -1 }`, the year `2011`
+      and index page ranges; ~10-20% of its edits were correct. Candidates are now recorded
+      in stats.sign_edits and counted in signs_flagged. See APPLY_SIGN_REPAIR below.
+
 Both are repairable because the PDF's own text layer holds the correct characters at the
 block's bbox. This module recovers them by LOCAL ANCHORING rather than global alignment:
 global diff fights the (legitimate) differences between the VLM's LaTeX and the text
