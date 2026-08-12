@@ -95,8 +95,13 @@ def test_pdftext_still_hands_us_the_surrogate_halves():
 def test_real_pdf_recovers_maths_glyphs():
     """End-to-end on a real maths-heavy paper, if the local library is present."""
     import glob
-    hits = glob.glob(str(REPO / "local_deploy/library/*/inbox/*.pdf")) + \
-        glob.glob(str(REPO / "local_deploy/library/*/done/*.pdf"))
+    # The corpus moved out of the fork on 2026-08-11. MINERU_PIPELINE_DATA is the one
+    # resolution point; this test degrades to "skipped" rather than failing without it.
+    import os
+    data = Path(os.environ.get("MINERU_PIPELINE_DATA",
+                               Path.home() / "code_local" / "minerU_pipeline_data"))
+    hits = glob.glob(str(data / "corpora/*/inbox/*.pdf")) + \
+        glob.glob(str(data / "corpora/*/done/*.pdf"))
     if not hits:
         print("  ~ skipped (no local library PDFs available)")
         return

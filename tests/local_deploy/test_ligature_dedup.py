@@ -20,9 +20,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_ROOT / "local_deploy"))
-
 import mineru.utils.pdf_text_tool as ptt  # noqa: E402
 
 FAILURES: list[str] = []
