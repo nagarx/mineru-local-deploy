@@ -66,11 +66,21 @@ def _producer() -> dict:
     """
     rels = ("convert.py", "postprocess.py", "repair.py", "coverage.py", "crosscheck.py")
     h = hashlib.sha256()
+    found: list[str] = []
     for rel in sorted(rels):
         p = _HERE / rel
         if p.is_file():
             data = p.read_bytes()
             h.update(rel.encode()); h.update(len(data).to_bytes(8, "big")); h.update(data)
+            found.append(rel)
+    if not found:
+        # Without this the receipt degrades into sha256(b"") — a stable, meaningless
+        # hash that would look like "the code never changed" precisely when the code
+        # has MOVED. Fail loudly instead; the module list is maintenance, not magic.
+        raise SystemExit(
+            f"snapshot.py: none of {list(rels)} were found beside {_HERE}. The "
+            f"provenance hash would be the hash of nothing. Update the module list."
+        )
     commit = dirty = None
     try:
         commit = subprocess.run(["git", "-C", str(_HERE.parent), "rev-parse", "HEAD"],
@@ -85,7 +95,8 @@ def _producer() -> dict:
     except Exception:
         render = {}
     return {"git_commit": commit, "git_dirty": dirty,
-            "rebuild_code_sha256": h.hexdigest(), "render": render}
+            "rebuild_code_sha256": h.hexdigest(), "rebuild_code_files": found,
+            "render": render}
 
 
 def _snapshot_one(args: tuple[str, str]) -> tuple[str, dict]:
@@ -135,40 +146,154 @@ def build(library: Path, jobs: int) -> dict:
     }
 
 
-def compare(baseline: dict, current: dict) -> int:
-    """Report drift. Returns a process exit code."""
+_HASH_FIELDS = (
+    ("md_sha256", "shipped .md (integrity)"),
+    ("content_list_sha256", "content_list.json (integrity)"),
+    ("qa_sha256", "qa.json (integrity)"),
+    ("rebuild_sha256", "offline rebuild (GATE A)"),
+)
+
+# Render settings that a pure offline rebuild CANNOT observe — rebuild reads cached JSON
+# and never rasterises a page. Mutation testing on 2026-08-12 confirmed the blind spot
+# exactly: setting EXPECTED_DPI to 72 moved 0 of 200 rebuild hashes. Comparing these here
+# is the only thing in this harness that can see a render regression at all.
+# `mineru_path` is deliberately NOT an invariant: it is an absolute path and changes
+# benignly whenever the tree moves, which it did on 2026-08-11.
+_RENDER_INVARIANTS = ("dpi", "page_to_image_defaults", "mineru_version")
+
+
+def _canon(v):
+    """Normalise a value the way a JSON round-trip would.
+
+    A comparison always straddles the JSON boundary: the baseline side was loaded from a
+    file (where a tuple has become a list) while the current side is live Python. So
+    `fork_render_settings()` returning (300, 4500) and the baseline holding [300, 4500]
+    are the SAME setting recorded twice. Without this, the render check false-positives on
+    every single run — measured on the first real run of the hardened gate, 2026-08-12.
+    """
+    if isinstance(v, (tuple, list)):
+        return [_canon(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _canon(x) for k, x in v.items()}
+    return v
+
+
+def compare(baseline: dict, current: dict, *, allow_new: bool = False) -> int:
+    """Report drift between two snapshots. Returns a process exit code.
+
+    Hardened 2026-08-12 (C3). The original had four ways to report success on a corpus
+    that had really changed, each verified by reading it rather than assumed:
+
+      1. Documents present only in the CURRENT run were printed but never counted, so a
+         gate run after new extractions passed while silently comparing nothing for them.
+      2. A field that was None on BOTH sides compared equal, so a document that fails to
+         rebuild in both runs — or whose .md is missing in both — read as OK rather than
+         as an absence of evidence.
+      3. The `producer` block was printed but never compared, so a render-DPI or cap
+         regression passed silently (see _RENDER_INVARIANTS).
+      4. `source_pdf_found` was recorded and then ignored, so losing PDF resolution —
+         which silently disables repair and salvage — was invisible for every document
+         that happened to need no repairs.
+    """
+    fail: list[str] = []
+    note: list[str] = []
+
+    bs, cs = baseline.get("schema_version"), current.get("schema_version")
+    if bs != cs:
+        print(f"SCHEMA MISMATCH: baseline {bs!r} vs current {cs!r} — not comparable.")
+        return 2
+
+    bp, cp = baseline.get("producer") or {}, current.get("producer") or {}
+    print(f"baseline produced by : {bp.get('git_commit')} (dirty={bp.get('git_dirty')})")
+    print(f"current  produced by : {cp.get('git_commit')} (dirty={cp.get('git_dirty')})")
+
+    if bp.get("git_dirty"):
+        note.append("baseline came from a DIRTY tree — it cannot be reproduced from its "
+                    "commit. Re-baseline from a clean tree.")
+    if bp.get("rebuild_code_sha256") == cp.get("rebuild_code_sha256"):
+        note.append("rebuild code is byte-identical to the baseline (so identical output "
+                    "proves nothing about a refactor — there was none).")
+    else:
+        note.append("rebuild code CHANGED since the baseline — this is what the gate is "
+                    "here to measure.")
+    if (bf := bp.get("rebuild_code_files")) != (cf := cp.get("rebuild_code_files")):
+        note.append(f"modules hashed: baseline {bf or '<not recorded>'} -> current {cf}")
+
+    # --- render invariants: the one regression class rebuild-vs-rebuild cannot see ---
+    br, cr = bp.get("render") or {}, cp.get("render") or {}
+    for k in _RENDER_INVARIANTS:
+        if _canon(br.get(k)) != _canon(cr.get(k)):
+            fail.append(f"render.{k}: {br.get(k)!r} -> {cr.get(k)!r}")
+
+    # --- document population ---------------------------------------------------------
     b, c = baseline["documents"], current["documents"]
     only_b, only_c = sorted(set(b) - set(c)), sorted(set(c) - set(b))
-    fields = ("md_sha256", "content_list_sha256", "qa_sha256", "rebuild_sha256")
-    drift: dict[str, list[str]] = {f: [] for f in fields}
-    for k in sorted(set(b) & set(c)):
-        for f in fields:
-            if b[k].get(f) != c[k].get(f):
-                drift[f].append(k)
-
-    print(f"baseline produced by : {baseline['producer'].get('git_commit')} "
-          f"(dirty={baseline['producer'].get('git_dirty')})")
-    print(f"current  produced by : {current['producer'].get('git_commit')} "
-          f"(dirty={current['producer'].get('git_dirty')})")
     print(f"documents: baseline {len(b)}  current {len(c)}")
     if only_b:
         print(f"  MISSING NOW ({len(only_b)}): {only_b[:5]}")
+        fail.append(f"{len(only_b)} document(s) present in the baseline are gone")
     if only_c:
         print(f"  NEW ({len(only_c)}): {only_c[:5]}")
+        if allow_new:
+            note.append(f"{len(only_c)} new document(s) — not compared (--allow-new)")
+        else:
+            fail.append(f"{len(only_c)} document(s) are new and therefore uncompared "
+                        f"(pass --allow-new if that is intended)")
+
+    # --- per-field drift, with absence treated as absence of evidence ----------------
+    shared = sorted(set(b) & set(c))
     print()
-    for f in fields:
-        n = len(drift[f])
-        label = {"md_sha256": "shipped .md (integrity)",
-                 "content_list_sha256": "content_list.json (integrity)",
-                 "qa_sha256": "qa.json (integrity)",
-                 "rebuild_sha256": "offline rebuild (GATE A)"}[f]
-        print(f"  {'OK ' if n == 0 else 'DRIFT'}  {label:<34} {n} changed")
-        for k in drift[f][:8]:
+    for f, label in _HASH_FIELDS:
+        drift = [k for k in shared if b[k].get(f) != c[k].get(f)]
+        # None on the CURRENT side means the artifact is missing or the rebuild threw.
+        # The old code let None == None pass as agreement; it is not agreement.
+        unusable = [k for k in shared if c[k].get(f) is None]
+        state = "OK   " if not drift and not unusable else "DRIFT"
+        extra = f", {len(unusable)} unusable" if unusable else ""
+        print(f"  {state}  {label:<34} {len(drift)} changed{extra}")
+        for k in drift[:8]:
             print(f"           {k[:76]}")
-    bad = len(only_b) + sum(len(v) for v in drift.values())
+        for k in unusable[:5]:
+            print(f"           [no value] {k[:66]}")
+        if drift:
+            fail.append(f"{label}: {len(drift)} changed")
+        if unusable:
+            fail.append(f"{label}: {len(unusable)} document(s) produced no value")
+
+    # --- state fields that were recorded and never checked ---------------------------
+    lost_pdf = [k for k in shared
+                if b[k].get("source_pdf_found") and not c[k].get("source_pdf_found")]
+    gained_pdf = [k for k in shared
+                  if c[k].get("source_pdf_found") and not b[k].get("source_pdf_found")]
+    new_err = [k for k in shared if c[k].get("rebuild_error") and not b[k].get("rebuild_error")]
+    print(f"  {'OK   ' if not lost_pdf else 'DRIFT'}  {'source PDF resolution':<34} "
+          f"{len(lost_pdf)} lost, {len(gained_pdf)} gained")
+    if lost_pdf:
+        # Losing the PDF silently disables repair and salvage. For a document that needed
+        # neither, the rebuild hash is unchanged — so this is invisible to every other row.
+        fail.append(f"source PDF resolution: {len(lost_pdf)} document(s) lost it "
+                    f"(repair and salvage go silently dead)")
+        for k in lost_pdf[:5]:
+            print(f"           {k[:76]}")
+    if gained_pdf:
+        note.append(f"{len(gained_pdf)} document(s) newly resolve their source PDF")
+    if new_err:
+        fail.append(f"rebuild raised for {len(new_err)} document(s) that were fine before")
+        print(f"  DRIFT  {'rebuild exceptions':<34} {len(new_err)} new")
+        for k in new_err[:5]:
+            print(f"           {c[k].get('rebuild_error', '')[:60]}  {k[:40]}")
+
     print()
-    print("SNAPSHOT MATCHES" if bad == 0 else f"{bad} difference(s) — investigate before proceeding")
-    return 0 if bad == 0 else 1
+    for n in note:
+        print(f"  note: {n}")
+    print()
+    if fail:
+        print(f"GATE FAILED — {len(fail)} finding(s):")
+        for f_ in fail:
+            print(f"  - {f_}")
+        return 1
+    print("SNAPSHOT MATCHES")
+    return 0
 
 
 def main() -> None:
@@ -179,6 +304,10 @@ def main() -> None:
     ap.add_argument("--compare", help="compare the live corpus against this snapshot")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2),
                     help="worker processes (default: cores-2)")
+    ap.add_argument("--allow-new", action="store_true",
+                    help="with --compare: tolerate documents absent from the baseline. "
+                         "They cannot be checked, so this weakens the gate — use it only "
+                         "when new extractions between the two runs are expected.")
     args = ap.parse_args()
 
     library = Path(args.library).expanduser().resolve()
@@ -191,7 +320,7 @@ def main() -> None:
 
     if args.compare:
         baseline = json.loads(Path(args.compare).read_text(encoding="utf-8"))
-        raise SystemExit(compare(baseline, current))
+        raise SystemExit(compare(baseline, current, allow_new=args.allow_new))
 
     if not args.out:
         raise SystemExit("pass --out to write a snapshot, or --compare to check one")
