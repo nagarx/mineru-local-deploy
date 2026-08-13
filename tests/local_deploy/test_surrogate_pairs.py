@@ -99,7 +99,7 @@ def test_real_pdf_recovers_maths_glyphs():
     # resolution point; this test degrades to "skipped" rather than failing without it.
     import os
     data = Path(os.environ.get("MINERU_PIPELINE_DATA",
-                               Path.home() / "code_local" / "minerU_pipeline_data"))
+                               Path.home() / "code_local" / "scriptorium"))
     hits = glob.glob(str(data / "corpora/*/inbox/*.pdf")) + \
         glob.glob(str(data / "corpora/*/done/*.pdf"))
     if not hits:
